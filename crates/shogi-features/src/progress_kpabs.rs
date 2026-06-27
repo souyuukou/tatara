@@ -3,10 +3,11 @@
 //! 仕様:
 //! - 特徴次元: `81 * FE_OLD_END = 81 * 1548 = 125_388` (玉位置 × BonaPiece)
 //! - 学習形式: logistic regression (`p = sigmoid(Σ w_i * x_i)`)
-//! - bucket 割当: caller が指定した `num_buckets ∈ [1, u8::MAX as usize + 1]`
-//!   に対し `min(num_buckets - 1, floor(p * num_buckets))`。返り値が `u8` の
-//!   ため上限は 256 (`bucket = num_buckets - 1` が `u8::MAX` に収まる)
-//! - 重み読込: `progress.bin` (f64 little-endian × 125_388 個、`8 * 125_388 = 1_003_104` bytes 固定)
+//! - bucket 割当 (v1 / 等幅): caller の `num_buckets` に対し
+//!   `min(num_buckets - 1, floor(p * num_buckets))`
+//! - bucket 割当 (v2 / 等頻度): `progress.bin` trailer の分位点閾値を使用
+//!   (`num_buckets` は trailer の N と一致必須)
+//! - 重み読込: `progress.bin` (f64 LE × 125_388 + 任意 quantile trailer)
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -15,10 +16,15 @@ use shogi_format::bona_piece::FE_OLD_END;
 use shogi_format::types::HAND_PIECE_TYPES;
 use shogi_format::{BonaPiece, Color, PackedSfenValue, ShogiBoard};
 
+use crate::progress_bin_format::{
+    ProgressBinning, equal_width_bucket, parse_progress_bin, quantile_bucket,
+};
+
 /// KP-absolute 特徴の次元数: `81 * FE_OLD_END`。
 pub const SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS: usize = 81 * FE_OLD_END;
 
 static SHOGI_PROGRESS_KP_ABS_WEIGHTS: OnceLock<Box<[f32]>> = OnceLock::new();
+static SHOGI_PROGRESS_BINNING: OnceLock<ProgressBinning> = OnceLock::new();
 static SHOGI_PROGRESS_KP_ABS_ZERO_WEIGHTS: [f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS] =
     [0.0; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
 
@@ -26,6 +32,7 @@ static SHOGI_PROGRESS_KP_ABS_ZERO_WEIGHTS: [f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGH
 ///
 /// 重みはプロセス全体で 1 つ (`OnceLock` で保持) のため、本 struct は `Copy`
 /// にできる。bucket 数 `N` は caller が指定する (LayerStack `--num-buckets` 等)。
+/// v2 `progress.bin` では trailer の N と一致必須。
 #[derive(Clone, Copy, Default)]
 pub struct ShogiProgressKPAbs;
 
@@ -36,6 +43,12 @@ impl ShogiProgressKPAbs {
             .map_or(&SHOGI_PROGRESS_KP_ABS_ZERO_WEIGHTS, |weights| {
                 weights.as_ref()
             })
+    }
+
+    fn binning() -> &'static ProgressBinning {
+        SHOGI_PROGRESS_BINNING
+            .get()
+            .unwrap_or(&ProgressBinning::EqualWidth)
     }
 
     /// 指定局面の KP-absolute 有効 index を全列挙し、`f` に渡す。
@@ -100,35 +113,51 @@ impl ShogiProgressKPAbs {
         Self::for_each_active_index(pos, |idx| out.push(idx));
     }
 
-    /// `progress.bin` (f64 LE × `NUM_WEIGHTS`、`1_003_104` bytes 固定) を読み込む。
+    /// `progress.bin` を読み込む。v1 (等幅) または v2 (等頻度 trailer) を受理。
     ///
     /// プロセスでロード可能な KP-absolute モデルは 1 つだけ (二回目以降は Err)。
     pub fn load_from_bin(path: &Path) -> Result<Self, String> {
         let bytes =
             std::fs::read(path).map_err(|e| format!("failed to read '{}': {e}", path.display()))?;
-        let expected = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS * std::mem::size_of::<f64>();
-        if bytes.len() != expected {
-            return Err(format!(
-                "progress.bin size mismatch: got {} bytes, expected {}",
-                bytes.len(),
-                expected
-            ));
-        }
-
-        let weights: Vec<f32> = bytes
-            .chunks_exact(std::mem::size_of::<f64>())
-            .map(|chunk| {
-                f64::from_le_bytes(chunk.try_into().expect("chunk size is checked")) as f32
-            })
-            .collect();
+        let (weights, binning) = parse_progress_bin(&bytes)?;
 
         SHOGI_PROGRESS_KP_ABS_WEIGHTS
             .set(weights.into_boxed_slice())
             .map_err(|_| {
                 "KP-absolute progress weights are already loaded in this process".to_string()
             })?;
+        SHOGI_PROGRESS_BINNING.set(binning).map_err(|_| {
+            "KP-absolute progress binning is already loaded in this process".to_string()
+        })?;
 
         Ok(Self)
+    }
+
+    /// ロード済み binning 方式。未ロード時は等幅。
+    pub fn loaded_binning() -> ProgressBinning {
+        Self::binning().clone()
+    }
+
+    /// 等頻度 trailer の `num_buckets`。等幅時は `None`。
+    pub fn quantile_num_buckets() -> Option<usize> {
+        Self::binning().quantile_num_buckets()
+    }
+
+    /// 等頻度 trailer 使用時、`num_buckets` が trailer の N と一致するか検証。
+    pub fn ensure_num_buckets_matches(num_buckets: usize) -> Result<(), String> {
+        match Self::binning() {
+            ProgressBinning::EqualWidth => Ok(()),
+            ProgressBinning::Quantile {
+                num_buckets: embedded,
+                ..
+            } if *embedded == num_buckets => Ok(()),
+            ProgressBinning::Quantile {
+                num_buckets: embedded,
+                ..
+            } => Err(format!(
+                "progress.bin quantile num_buckets={embedded} does not match requested num_buckets={num_buckets}"
+            )),
+        }
     }
 
     /// progress 推定 (`0.0..=1.0`)。重み未ロードでは常に 0.5 (sigmoid(0))。
@@ -146,16 +175,13 @@ impl ShogiProgressKPAbs {
         p.clamp(0.0, 1.0)
     }
 
-    /// N-bucket 割当 (`0..=num_buckets-1`)。`num_buckets ∈ [1, MAX_NUM_BUCKETS]`
-    /// を assert する (返り値が `u8` のため上限 256)。`num_buckets = 9` で
-    /// `floor(p * 9).clamp(0, 8)` を返し、index 8 まで emit する (LayerStack
-    /// 既定)。`num_buckets = N` での split 境界は `i / N` (`i = 0..N`) で等間隔。
+    /// N-bucket 割当 (`0..=num_buckets-1`)。等幅は `floor(p × N)`、等頻度は
+    /// trailer 閾値。等頻度時は `num_buckets` が trailer の N と一致必須。
     pub fn bucket(&self, pos: &PackedSfenValue, num_buckets: usize) -> u8 {
         self.bucket_board(&pos.decode(), num_buckets)
     }
 
     /// `bucket` の **decode 済み `ShogiBoard` を直接受ける** 版。
-    /// `bucket(&pos, n)` は `bucket_board(&pos.decode(), n)` と等価。
     pub fn bucket_board(&self, board: &ShogiBoard, num_buckets: usize) -> u8 {
         assert!(
             (1..=MAX_NUM_BUCKETS).contains(&num_buckets),
@@ -164,11 +190,20 @@ impl ShogiProgressKPAbs {
              fits in u8"
         );
         let p = self.progress_board(board);
-        // num_buckets <= 256 を assert 済なので `as i32` キャストは無誤差、
-        // clamp の上下境界 (i32::MIN..i32::MAX 内) も安全に評価できる。
-        let n_i32 = num_buckets as i32;
-        let raw = (p * num_buckets as f32).floor() as i32;
-        raw.clamp(0, n_i32 - 1) as u8
+        match Self::binning() {
+            ProgressBinning::EqualWidth => equal_width_bucket(p, num_buckets),
+            ProgressBinning::Quantile {
+                num_buckets: embedded,
+                thresholds,
+            } => {
+                assert_eq!(
+                    *embedded, num_buckets,
+                    "progress.bin quantile num_buckets={embedded} does not match \
+                     requested num_buckets={num_buckets}"
+                );
+                quantile_bucket(p, num_buckets, thresholds)
+            }
+        }
     }
 }
 
@@ -180,6 +215,7 @@ pub const MAX_NUM_BUCKETS: usize = u8::MAX as usize + 1;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::progress_bin_format::write_progress_bin_bytes;
 
     /// shogi-format crate の `tests/data/sample.psv` (100 records × 40 bytes)。
     fn sample_psv_records() -> Vec<PackedSfenValue> {
@@ -200,13 +236,6 @@ mod tests {
 
     #[test]
     fn board_path_matches_legacy_path_on_real_psv() {
-        // legacy delegating path (`for_each_active_index(&psv)` / `progress(&psv)` /
-        // `bucket(&psv)` は内部で `psv.decode()` → board path) と board path
-        // (`*_board(&psv.decode())`) が完全に一致する不変条件を実 PSV で確認する。
-        //
-        // NOTE: 重みは未ロード前提 (zero weights → progress = sigmoid(0) = 0.5、
-        // bucket 4)。本 unit-test binary では `load_from_bin` を一切呼ばないので
-        // `SHOGI_PROGRESS_KP_ABS_WEIGHTS` (OnceLock) は未 set のまま。
         let kpabs = ShogiProgressKPAbs;
         let records = sample_psv_records();
         let mut total_active = 0usize;
@@ -221,7 +250,6 @@ mod tests {
                 via_legacy, via_board,
                 "record {i}: for_each_active_index の legacy/board path 不一致"
             );
-            // 全 index が valid 範囲内。
             for &idx in &via_board {
                 assert!(
                     idx < SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS,
@@ -240,8 +268,6 @@ mod tests {
                 kpabs.bucket_board(&board, 9),
                 "record {i}: bucket の legacy/board path 不一致"
             );
-            // zero weights → progress 厳密に 0.5。`floor(0.5 * N) = N/2` で
-            // N=8 / N=9 ともに 4。
             assert_eq!(kpabs.progress(psv), 0.5, "record {i}: zero-weight progress");
             assert_eq!(
                 kpabs.bucket(psv, 9),
@@ -262,8 +288,6 @@ mod tests {
 
     #[test]
     fn bucket_board_matches_bucket_zero_weights() {
-        // 最小局面 (両玉のみ) でも legacy/board path が一致し、zero-weight で
-        // progress = 0.5 / bucket = 4 (N=8 / N=9 共通) になることを確認。
         let mut board = ShogiBoard {
             side_to_move: Color::Black,
             ..Default::default()
@@ -278,8 +302,6 @@ mod tests {
 
     #[test]
     fn bucket_board_ranges_for_varied_n() {
-        // zero weights → p = 0.5。N を 1..=9 まで振って `floor(p*N) = floor(0.5*N)`
-        // が返ることを確認 (N が偶数なら N/2、奇数なら (N-1)/2、N=1 は常に 0)。
         let board = ShogiBoard {
             side_to_move: Color::Black,
             black_king_sq: shogi_format::types::Square::new(4, 8),
@@ -297,8 +319,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "num_buckets must be in [1, 256]")]
     fn bucket_board_rejects_too_large_num_buckets() {
-        // 上限 (MAX_NUM_BUCKETS = u8::MAX + 1 = 256) 超えは panic で reject される
-        // (`u8` 返り値で `bucket = num_buckets - 1` が表現可能な範囲のみ受け付ける)。
         let board = ShogiBoard {
             side_to_move: Color::Black,
             black_king_sq: shogi_format::types::Square::new(4, 8),
@@ -306,5 +326,35 @@ mod tests {
             ..Default::default()
         };
         let _ = ShogiProgressKPAbs.bucket_board(&board, MAX_NUM_BUCKETS + 1);
+    }
+
+    #[test]
+    fn quantile_load_and_num_buckets_check() {
+        let path =
+            std::env::temp_dir().join(format!("tatara_progress_q_{}.bin", std::process::id()));
+        let weights = vec![0.0_f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
+        let binning = ProgressBinning::Quantile {
+            num_buckets: 4,
+            thresholds: Box::from([0.25_f32, 0.5, 0.75]),
+        };
+        let bytes = write_progress_bin_bytes(&weights, &binning).expect("write bytes");
+        std::fs::write(&path, &bytes).expect("write file");
+
+        let kpabs = ShogiProgressKPAbs::load_from_bin(&path).expect("load");
+        assert!(ShogiProgressKPAbs::loaded_binning().is_quantile());
+        assert_eq!(ShogiProgressKPAbs::quantile_num_buckets(), Some(4));
+        ShogiProgressKPAbs::ensure_num_buckets_matches(4).expect("match");
+        let err = ShogiProgressKPAbs::ensure_num_buckets_matches(16).unwrap_err();
+        assert!(err.contains("4"));
+        assert!(err.contains("16"));
+
+        let board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: shogi_format::types::Square::new(4, 8),
+            white_king_sq: shogi_format::types::Square::new(4, 0),
+            ..Default::default()
+        };
+        assert_eq!(kpabs.bucket_board(&board, 4), 2);
+        let _ = std::fs::remove_file(&path);
     }
 }

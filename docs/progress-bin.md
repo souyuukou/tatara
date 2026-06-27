@@ -74,6 +74,39 @@ It prints a per-bucket count and percentage plus the top bucket's share. Only
 one `progress.bin` can be loaded per run, so to compare epochs run it once per
 `<run-name>.e<N>.bin` and compare the outputs.
 
+By default, bucket assignment uses **equal-width** binning on `p ∈ [0, 1]`:
+`floor(p × N)`. If the spread is badly skewed, use quantile calibration below.
+
+## Equal-frequency calibration (v2 progress.bin)
+
+When equal-width bins concentrate too many positions in a few buckets, calibrate
+quantile thresholds from a representative PSV sample and embed them in
+`progress.bin` as a trailer (magic `PRGQ`, format version 1). See
+[docs/decisions/2026-06-27-progress-quantile-binning.md](decisions/2026-06-27-progress-quantile-binning.md).
+
+```bash
+target/release/progress-bucket-survey \
+  --data <path/to/consecutive-psv.bin> \
+  --progress output/progress/<run-name>.e5.bin \
+  --num-buckets 32 --samples 500000 \
+  --write-calibrated output/progress/<run-name>.e5.q32.bin
+```
+
+This copies the weights from `--progress`, computes `(N-1)` quantile thresholds
+from the sampled positions, and writes a v2 file. The tool prints a post-
+calibration histogram on the same sample (each bucket should be roughly `100/N`
+percent). Use the calibrated file with matching `--num-buckets`:
+
+```bash
+target/release/nnue-train layerstack \
+  --progress-coeff output/progress/<run-name>.e5.q32.bin \
+  --num-buckets 32 ...
+```
+
+`--num-buckets` must match the `N` baked into the trailer. Recalibrate when
+changing `N` or when the training PSV distribution differs materially from the
+calibration sample.
+
 Once you have a `progress.bin` you are happy with, pass it to `nnue-train` via
 `--progress-coeff` when training a `layerstack` net (see
 [docs/training-quickstart.md](training-quickstart.md)).

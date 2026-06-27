@@ -69,5 +69,36 @@ bucket ごとの件数・割合と top bucket の占有率を表示する。1 �
 `progress.bin` は 1 つなので、epoch を比較するときは `<run-name>.e<N>.bin` ごとに
 1 回ずつ実行して出力を比べる。
 
+既定では `p ∈ [0, 1]` の**等幅**分割 (`floor(p × N)`) を使う。偏りが大きい場合は
+下記の等頻度キャリブレーションを検討する。
+
+## 等頻度キャリブレーション (v2 progress.bin)
+
+等幅 bin で特定 bucket に偏る場合、代表 PSV から分位点閾値を求め、`progress.bin`
+の trailer (`PRGQ` magic、format version 1) として埋め込める。仕様は
+[docs/decisions/2026-06-27-progress-quantile-binning.md](decisions/2026-06-27-progress-quantile-binning.md) を参照。
+
+```bash
+target/release/progress-bucket-survey \
+  --data <path/to/consecutive-psv.bin> \
+  --progress output/progress/<run-name>.e5.bin \
+  --num-buckets 32 --samples 500000 \
+  --write-calibrated output/progress/<run-name>.e5.q32.bin
+```
+
+`--progress` の重みをコピーし、サンプル局面の progress 値から `N-1` 個の閾値を
+計算して v2 ファイルを書き出す。同一サンプル上のキャリブレーション後 histogram
+も表示される (各 bucket はおおよそ `100/N %`)。trailer の `N` と一致する
+`--num-buckets` で NNUE 学習に渡す:
+
+```bash
+target/release/nnue-train layerstack \
+  --progress-coeff output/progress/<run-name>.e5.q32.bin \
+  --num-buckets 32 ...
+```
+
+`N` を変える場合や学習 PSV の分布がキャリブレーション集合と大きく異なる場合は
+再キャリブレーションが必要。
+
 満足のいく `progress.bin` が得られたら、`layerstack` net の学習時に `nnue-train`
 へ `--progress-coeff` で渡す([docs/training-quickstart.ja.md](training-quickstart.ja.md) 参照)。

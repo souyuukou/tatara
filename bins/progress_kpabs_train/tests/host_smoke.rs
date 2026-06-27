@@ -215,6 +215,24 @@ fn progress_bin_rejects_wrong_size() {
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }
 
+#[test]
+fn progress_bin_reads_weights_from_v2_trailer_file() {
+    use shogi_features::{ProgressBinning, write_progress_bin_bytes};
+
+    let dir = tempdir();
+    let path = dir.join("progress_v2.bin");
+    let weights = vec![1.0_f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
+    let binning = ProgressBinning::Quantile {
+        num_buckets: 4,
+        thresholds: Box::from([0.2_f32, 0.4, 0.6]),
+    };
+    let bytes = write_progress_bin_bytes(&weights, &binning).expect("encode v2");
+    std::fs::write(&path, &bytes).expect("write v2");
+    let read = read_progress_bin(&path).expect("read weights from v2");
+    assert_eq!(read.len(), weights.len());
+    assert!(read.iter().all(|&w| w == 1.0_f32));
+}
+
 /// 一時ディレクトリ helper (tempfile crate の dep を避けるため最小実装)。
 fn tempdir() -> PathBuf {
     let pid = std::process::id();

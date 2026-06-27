@@ -277,9 +277,20 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     let progress = match &layerstack.progress_coeff {
         Some(p) => {
             println!("[train] loading progress8kpabs coeff: {}", p.display());
-            ShogiProgressKPAbs::load_from_bin(p).map_err(|e| -> Box<dyn std::error::Error> {
-                format!("failed to load --progress-coeff {}: {e}", p.display()).into()
-            })?
+            let loaded = ShogiProgressKPAbs::load_from_bin(p).map_err(
+                |e| -> Box<dyn std::error::Error> {
+                    format!("failed to load --progress-coeff {}: {e}", p.display()).into()
+                },
+            )?;
+            ShogiProgressKPAbs::ensure_num_buckets_matches(layerstack.num_buckets)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            let binning_label = if ShogiProgressKPAbs::loaded_binning().is_quantile() {
+                format!("quantile N={}", layerstack.num_buckets)
+            } else {
+                "equal-width".to_string()
+            };
+            println!("[train] progress bucket binning: {binning_label}");
+            loaded
         }
         None => {
             eprintln!(
