@@ -48,12 +48,10 @@ pub(crate) const DEFAULT_L2_OUT: usize = 32;
 /// trainer accepts `[2, MAX_SUPPORTED_NUM_BUCKETS]`.
 pub(crate) const DEFAULT_NUM_BUCKETS: usize = 9;
 
-/// Maximum supported bucket count without changing the per-bucket weight
-/// backward kernels (`dense_mm_bwd_weight_bucket_tiled_{l2,l3}`). The kernels
-/// hold a fixed 9-register accumulator (`a0..a8`); values up to 9 are silent
-/// skipped via the runtime `num_buckets` arg, but larger N would need a kernel
-/// restructure (register fan-out → `blockIdx.z` grid axis).
-pub(crate) const MAX_SUPPORTED_NUM_BUCKETS: usize = 9;
+/// Maximum LayerStack bucket count. Per-bucket kernels use `blockIdx.z` as the
+/// bucket axis; 256 keeps the public range bounded while leaving ample room for
+/// progress-binning experiments.
+pub(crate) const MAX_SUPPORTED_NUM_BUCKETS: usize = 256;
 
 // FT post-activation と l1_sqr の固定スケール (qa=127 量子化由来、`127.0/128.0`)。
 pub(crate) const FT_POST_SCALE: f32 = 127.0 / 128.0;

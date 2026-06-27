@@ -50,6 +50,28 @@ fn layerstack_subcommand_parses() {
 }
 
 #[test]
+fn num_buckets_accepts_new_range_and_rejects_boundaries() {
+    for value in [2, 9, 10, 256] {
+        assert_eq!(
+            layerstack_args(&["--num-buckets", &value.to_string()]).num_buckets,
+            value
+        );
+    }
+    for value in [1, 257] {
+        assert!(
+            Cli::try_parse_from([
+                "nnue-train",
+                "layerstack",
+                "--num-buckets",
+                &value.to_string(),
+            ])
+            .is_err(),
+            "num-buckets={value} must be rejected"
+        );
+    }
+}
+
+#[test]
 fn simple_subcommand_parses() {
     let cli = Cli::try_parse_from(["nnue-train", "simple"]).expect("simple subcommand");
     assert_eq!(cli.arch.kind(), ArchKind::Simple);

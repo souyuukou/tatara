@@ -497,7 +497,7 @@ impl TrainingConfig {
         if self.num_buckets == 0 {
             return Err(io::Error::other(
                 "num_buckets must be >= 1 (`progress.bucket_board` requires at \
-                 least one bucket; LayerStack uses `--num-buckets` in [2, 9])",
+                 least one bucket; LayerStack uses `--num-buckets` in [2, 256])",
             ));
         }
         Ok(())

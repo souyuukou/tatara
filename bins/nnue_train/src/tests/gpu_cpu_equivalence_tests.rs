@@ -706,6 +706,28 @@ fn bucket_idx_with_padding(batch: usize, num_buckets: usize) -> Vec<i32> {
         .collect()
 }
 
+/// `exclusive_scan_aligned` + `scatter_bucket_perm` と同じ 16-aligned layout を
+/// host 上で作る。indexed weight-backward kernel 単体テスト用。
+fn aligned_bucket_permutation(bucket_idx: &[i32], num_buckets: usize) -> (Vec<u32>, Vec<i32>) {
+    let mut offsets = Vec::with_capacity(num_buckets + 1);
+    let mut permutation = Vec::new();
+    for bucket in 0..=num_buckets {
+        while !permutation.len().is_multiple_of(16) {
+            permutation.push(-1);
+        }
+        offsets.push(permutation.len() as u32);
+        if bucket < num_buckets {
+            permutation.extend(
+                bucket_idx
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row, &value)| (value == bucket as i32).then_some(row as i32)),
+            );
+        }
+    }
+    (offsets, permutation)
+}
+
 #[test]
 fn dense_mm_fwd_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
@@ -1002,19 +1024,19 @@ fn dense_mm_bwd_weight_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
-fn dense_mm_bwd_weight_bucket_tiled_l2_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+fn dense_mm_bwd_weight_bucket_indexed_l2_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     // L2 weight backward: out_dim は L2 出力次元 (`--l2`、可変)、in_dim = l2_in
     // (= 2*(l1_out-1)、`--l1` 依存)。既定 out_dim 32 と非既定 {16, 64, 256} を
     // 各種 in_dim・非 16 倍数 out_dim と組み合わせて検証する。
     let (_ctx, module, stream) = open_module()?;
-    for &(batch, in_dim, out_dim) in &[
-        (16_usize, 30_usize, 32_usize), // 既定形状
-        (64, 46, 16),
-        (256, 62, 64),
-        (1024, 14, 256),
-        (32, 96, 30), // 非 16 倍数の out_dim
+    for &(batch, in_dim, out_dim, nb) in &[
+        (16_usize, 30_usize, 32_usize, 9_usize), // 既定形状
+        (64, 46, 16, 10),
+        (260, 6, 3, 256), // 空 bucket、padding、範囲外 index を含む上限値
+        (256, 62, 64, 9),
+        (1024, 14, 256, 9),
+        (32, 96, 30, 9), // 非 16 倍数の out_dim
     ] {
-        let nb = DEFAULT_NUM_BUCKETS;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.013 - 0.4)
@@ -1034,24 +1056,26 @@ fn dense_mm_bwd_weight_bucket_tiled_l2_matches_cpu() -> Result<(), Box<dyn std::
 
         let x_dev = DeviceBuffer::from_host(&stream, &x)?;
         let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
-        let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+        let (offsets, permutation) = aligned_bucket_permutation(&bucket_idx, nb);
+        let offsets_dev = DeviceBuffer::from_host(&stream, &offsets)?;
+        let permutation_dev = DeviceBuffer::from_host(&stream, &permutation)?;
         let dw_dev = DeviceBuffer::<f32>::zeroed(&stream, nb * out_dim * in_dim)?;
         let num_splits = 8_usize;
         let cell_blocks = (out_dim * in_dim).div_ceil(256);
         let config = LaunchConfig {
-            grid_dim: (cell_blocks as u32, num_splits as u32, 1),
+            grid_dim: (cell_blocks as u32, num_splits as u32, nb as u32),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
         cuda_launch! {
-            kernel: dense_mm_bwd_weight_bucket_tiled_l2, stream: stream, module: module,
+            kernel: dense_mm_bwd_weight_bucket_indexed, stream: stream, module: module,
             config: config,
-            args: [slice(x_dev), slice(dy_dev), slice(bidx_dev), slice(dw_dev),
-                   batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+            args: [slice(x_dev), slice(dy_dev), slice(offsets_dev), slice(permutation_dev),
+                   slice(dw_dev), in_dim as u32, out_dim as u32, nb as u32]
         }?;
         stream.synchronize()?;
         assert_close_rel(
-            &format!("dense_mm_bwd_weight_bucket_tiled_l2 b={batch}"),
+            &format!("dense_mm_bwd_weight_bucket_indexed l2 b={batch}"),
             &dw_dev.to_host_vec(&stream)?,
             &dw_cpu,
             TOL,
@@ -1061,20 +1085,20 @@ fn dense_mm_bwd_weight_bucket_tiled_l2_matches_cpu() -> Result<(), Box<dyn std::
 }
 
 #[test]
-fn dense_mm_bwd_weight_bucket_tiled_l3_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+fn dense_mm_bwd_weight_bucket_indexed_l3_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     // tiled L3 (out_dim=1, num_buckets=9; in_dim は L2 出力次元 l2_out、可変)。
     // host は block_dim を in_dim に一致させる。既定 in_dim 32 と非既定
     // {16, 64, 256}・非 16 倍数の 30 を検証する。
     let (_ctx, module, stream) = open_module()?;
-    for &(batch, in_dim) in &[
-        (16_usize, 32_usize), // 既定形状
-        (64, 16),
-        (256, 64),
-        (1024, 256),
-        (32, 30), // 非 16 倍数の in_dim
+    for &(batch, in_dim, nb) in &[
+        (16_usize, 32_usize, 9_usize), // 既定形状
+        (64, 16, 10),
+        (260, 6, 256), // 空 bucket、padding、範囲外 index を含む上限値
+        (256, 64, 9),
+        (1024, 256, 9),
+        (32, 30, 9), // 非 16 倍数の in_dim
     ] {
         let out_dim = 1_usize;
-        let nb = DEFAULT_NUM_BUCKETS;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.013 - 0.4)
@@ -1094,24 +1118,25 @@ fn dense_mm_bwd_weight_bucket_tiled_l3_matches_cpu() -> Result<(), Box<dyn std::
 
         let x_dev = DeviceBuffer::from_host(&stream, &x)?;
         let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
-        let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+        let (offsets, permutation) = aligned_bucket_permutation(&bucket_idx, nb);
+        let offsets_dev = DeviceBuffer::from_host(&stream, &offsets)?;
+        let permutation_dev = DeviceBuffer::from_host(&stream, &permutation)?;
         let dw_dev = DeviceBuffer::<f32>::zeroed(&stream, nb * out_dim * in_dim)?;
         let num_splits = 8_usize;
-        // block_dim は in_dim (= L2 出力次元) に一致させる (kernel は 1 thread = 1 ii cell)。
         let config = LaunchConfig {
-            grid_dim: (num_splits as u32, 1, 1),
-            block_dim: (in_dim as u32, 1, 1),
+            grid_dim: (in_dim.div_ceil(256) as u32, num_splits as u32, nb as u32),
+            block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
         cuda_launch! {
-            kernel: dense_mm_bwd_weight_bucket_tiled_l3, stream: stream, module: module,
+            kernel: dense_mm_bwd_weight_bucket_indexed, stream: stream, module: module,
             config: config,
-            args: [slice(x_dev), slice(dy_dev), slice(bidx_dev), slice(dw_dev),
-                   batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+            args: [slice(x_dev), slice(dy_dev), slice(offsets_dev), slice(permutation_dev),
+                   slice(dw_dev), in_dim as u32, out_dim as u32, nb as u32]
         }?;
         stream.synchronize()?;
         assert_close_rel(
-            &format!("dense_mm_bwd_weight_bucket_tiled_l3 b={batch}"),
+            &format!("dense_mm_bwd_weight_bucket_indexed l3 b={batch}"),
             &dw_dev.to_host_vec(&stream)?,
             &dw_cpu,
             TOL,
@@ -2072,17 +2097,17 @@ fn simple_act_grad_to_fp16_crelu_clamp_counter_counts_overflows()
 }
 
 // =============================================================================
-// `--num-buckets` 可変 N (N ≤ MAX_SUPPORTED_NUM_BUCKETS = 9) を GPU/CPU で
+// `--num-buckets` 可変 N (N ≤ MAX_SUPPORTED_NUM_BUCKETS) を GPU/CPU で
 // exercise する parametrised test。既存テストは既定 N=9 で動かしているが、
-// kernel は `num_buckets` を runtime 引数で受けるため N ≤ 9 で同じ correctness
+// kernel は `num_buckets` を runtime 引数で受けるため全範囲で同じ correctness
 // 不変条件 (`bucket_idx >= num_buckets` を silent skip、CPU と bit-equal) が
-// 成立する。本セクションでは `N ∈ {2, 4, 8, 9}` の主要 N で fwd / bwd_input /
+// 成立する。本セクションでは境界値を含む主要 N で fwd / bwd_input /
 // bwd_weight / bias_grad を回し、host plumbing 経由で kernel が runtime N を
 // 正しく受け取れていることを確認する。
 // =============================================================================
 
 /// `--num-buckets` で実験的に使う想定の N 値。
-const NUM_BUCKETS_PARAM_VALUES: [usize; 4] = [2, 4, 8, 9];
+const NUM_BUCKETS_PARAM_VALUES: [usize; 6] = [2, 4, 8, 9, 10, 256];
 
 #[test]
 fn dense_mm_fwd_bucket_matches_cpu_for_each_num_buckets() -> Result<(), Box<dyn std::error::Error>>

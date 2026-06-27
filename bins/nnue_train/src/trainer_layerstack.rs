@@ -2299,31 +2299,25 @@ impl GpuTrainer {
                 b_u32, l2_out as u32, 1_u32, self.num_buckets as u32
             ]
         }?;
-        // L3 weight bwd: in_dim=l2_out, out_dim=1, num_buckets<=9。
-        // 元 kernel は (out_dim*in_dim*num_buckets) cells × scan batch で並列度小。
-        // split-K + 9-register bucket accumulator (`dense_mm_bwd_weight_bucket_tiled_l3`)
-        // に切替。kernel の register accumulator (`a0..a8`) は `num_buckets` を runtime
-        // 引数で受け、`buc >= num_buckets` は flush も accumulate もされない silent skip
-        // で動く。1 thread = 1 in_dim cell なので block_dim は in_dim (= l2_out) と一致
-        // させる (kernel は `ii >= in_dim` を return するため block_dim < in_dim だと
-        // 末尾 cell が未計算になる)。num_splits=64 → 64 blocks × l2_out threads。
-        // `--l2 <= 256` を CLI が保証するので block_dim は 1024 上限を超えない。
-        debug_assert!(self.num_buckets <= MAX_SUPPORTED_NUM_BUCKETS);
+        // L3 weight backward: fwd_L1 で構築した bucket offset / permutation を再利用する。
+        // grid_z の各 bucket は自身の sorted slice だけを split-K で走査するため、bucket
+        // 数を増やしても batch 全体の反復 scan は発生しない。
         cuda_launch! {
-            kernel: dense_mm_bwd_weight_bucket_tiled_l3,
+            kernel: dense_mm_bwd_weight_bucket_indexed,
             stream: self.stream,
             module: self.module,
             config: LaunchConfig {
-                grid_dim: (64, 1, 1),
-                block_dim: (l2_out as u32, 1, 1),
+                grid_dim: (l2_out.div_ceil(256) as u32, 64, self.num_buckets as u32),
+                block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             },
             args: [
                 slice(self.ws.l2_acted),
                 slice(self.ws.dy_net_output),
-                slice(self.ws.bucket_idx_dev),
+                slice(self.ws.bucket_offsets_dev),
+                slice(self.ws.bucket_perm_dev),
                 slice(self.l3_w_grad),
-                b_u32, l2_out as u32, 1_u32, self.num_buckets as u32
+                l2_out as u32, 1_u32, self.num_buckets as u32
             ]
         }?;
         cuda_launch! {
@@ -2369,25 +2363,28 @@ impl GpuTrainer {
                 b_u32, l2_in as u32, l2_out as u32, self.num_buckets as u32
             ]
         }?;
-        // L2 weight backward: split-K + 9 bucket register accumulator。weight cell 空間
-        // (per-bucket l2_out × l2_in) を grid_x、batch split-K を grid_y に分け、block_dim は
-        // 256 固定で launch する (`block_dim = l2_out * l2_in` だと l2_in 次第で 1024 thread を
-        // 超えるため)。
+        // L2 weight backward: L3 と同じ indexed sorted kernel。weight cell 空間を grid_x、
+        // bucket 内 split-K を grid_y、bucket を grid_z に分ける。
         cuda_launch! {
-            kernel: dense_mm_bwd_weight_bucket_tiled_l2,
+            kernel: dense_mm_bwd_weight_bucket_indexed,
             stream: self.stream,
             module: self.module,
             config: LaunchConfig {
-                grid_dim: ((l2_out * l2_in).div_ceil(256) as u32, 64, 1),
+                grid_dim: (
+                    (l2_out * l2_in).div_ceil(256) as u32,
+                    64,
+                    self.num_buckets as u32,
+                ),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             },
             args: [
                 slice(self.ws.l2_input),
                 slice(self.ws.dl2_out),
-                slice(self.ws.bucket_idx_dev),
+                slice(self.ws.bucket_offsets_dev),
+                slice(self.ws.bucket_perm_dev),
                 slice(self.l2_w_grad),
-                b_u32, l2_in as u32, l2_out as u32, self.num_buckets as u32
+                l2_in as u32, l2_out as u32, self.num_buckets as u32
             ]
         }?;
         // L2 bias backward (sorted): dl2_out を bucket_perm_dev で gather → dl2_out_sorted、

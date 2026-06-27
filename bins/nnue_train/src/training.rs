@@ -261,14 +261,11 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         )
         .into());
     }
-    // bucket 数の下限 2 は progress binning が意味を持つ最小値。上限 9 は L2 / L3
-    // per-bucket weight backward kernel の固定 9-register accumulator 容量
-    // (`MAX_SUPPORTED_NUM_BUCKETS`)。larger N would need the per-bucket weight
-    // backward kernels' register fan-out to be generalised.
+    // bucket 数の下限 2 は progress binning が意味を持つ最小値。上限は公開 CLI と
+    // per-bucket kernel の grid-z 契約を共有する。
     if !(2..=MAX_SUPPORTED_NUM_BUCKETS).contains(&layerstack.num_buckets) {
         return Err(format!(
-            "--num-buckets must be in [2, {MAX_SUPPORTED_NUM_BUCKETS}] (got {}); larger N \
-             requires the per-bucket weight backward kernels to be generalised",
+            "--num-buckets must be in [2, {MAX_SUPPORTED_NUM_BUCKETS}] (got {})",
             layerstack.num_buckets
         )
         .into());

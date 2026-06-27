@@ -534,8 +534,7 @@ pub(crate) struct LayerstackArgs {
 
     /// LayerStack output bucket count. Each position is routed to bucket
     /// `min(N-1, floor(p * N))` where `p` is the progress estimate. Specify a
-    /// value in `[2, 9]`; the upper bound is the fixed 9-register accumulator
-    /// in the per-bucket weight backward kernels. The default 9 keeps the
+    /// value in `[2, 256]`. The default 9 keeps the
     /// binning and weight-buffer shape identical to the standard layout and
     /// resume-compatible with existing checkpoints. The historical 8-bucket
     /// progress emission used `floor(p * 8)` on a 9-slot layout, leaving slot 8
@@ -543,7 +542,7 @@ pub(crate) struct LayerstackArgs {
     /// default) actually emits index 8 — existing 9-bucket distributed nets
     /// have an untrained slot 8 and may see a short-term eval shift on the
     /// `p in [8/9, 1]` tail until continued training catches up.
-    #[arg(long, default_value_t = DEFAULT_NUM_BUCKETS)]
+    #[arg(long, default_value_t = DEFAULT_NUM_BUCKETS, value_parser = parse_num_buckets)]
     pub(crate) num_buckets: usize,
 
     /// Opt-in flag to use Ampere+ Tensor Cores in TF32 mode. `true` calls cuBLAS
@@ -658,6 +657,19 @@ pub(crate) struct LayerstackArgs {
     /// OOMs.
     #[arg(long = "threat-profile", default_value = "off")]
     pub(crate) threat_profile: String,
+}
+
+fn parse_num_buckets(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid bucket count '{value}'"))?;
+    if (2..=MAX_SUPPORTED_NUM_BUCKETS).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err(format!(
+            "bucket count must be in [2, {MAX_SUPPORTED_NUM_BUCKETS}]"
+        ))
+    }
 }
 
 impl LayerstackArgs {
