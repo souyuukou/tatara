@@ -1112,7 +1112,7 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l1(
 ///
 /// 数値同等性: 加算順序が sort 済 batch 順 + split-K 集約順になるため fp32 associativity で
 /// baseline と bit-exact ではないが、reduction tolerance (相対誤差 < `TOL`) 内で一致。
-/// `in_dim % 16 == 0` / `num_buckets <= 256` / `padded_batch % 16 == 0` /
+/// `in_dim % 16 == 0` / `num_buckets <= BUCKET_SORT_MAX_N` / `padded_batch % 16 == 0` /
 /// `bucket_offsets` が aligned exclusive scan 出力 / `blockIdx_x` 範囲は caller 契約。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
@@ -1692,7 +1692,7 @@ pub fn inverse_permute_rows_f32(input: &[f32], perm: &[i32], output: &[f32], bat
 /// `out_dim` が 16 の倍数でないとき末尾 out-tile は `oi_ok` guard で部分書き込み。
 ///
 /// 数値同等性: per-row independent (k=0..15 加算順保持) で baseline と bit-exact、
-/// sort stability 不要。`in_dim % 16 == 0` / `batch % 16 == 0` / `num_buckets <= 256` /
+/// sort stability 不要。`in_dim % 16 == 0` / `batch % 16 == 0` / `num_buckets <= BUCKET_SORT_MAX_N` /
 /// `grid_dim_y == ceil(out_dim/16)` は caller 契約。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
@@ -1949,6 +1949,69 @@ pub fn dense_mm_bwd_weight_bucket_indexed(
             acc += x[row * in_dim_u + ii] * dy[row * out_dim_u + oi];
         }
         sorted_row += 1;
+    }
+
+    let raw = grad_w.as_ptr();
+    unsafe {
+        let c = &*(raw.add(block_buc * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+        c.fetch_add(acc, AtomicOrdering::Relaxed);
+    }
+}
+
+/// Sort 不要の per-bucket weight backward。`blockIdx.z` = bucket、各 thread が
+/// 1 weight cell を担当し batch 全走査で `bucket_idx[b] == blockIdx.z` の行だけ
+/// accumulate する。[`dense_mm_bwd_weight_bucket_indexed`] の sort 引数版と同 grid
+/// 契約 (`grid_z = num_buckets <= 65535`)。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_bwd_weight_bucket_unsorted(
+    x: &[f32],
+    dy: &[f32],
+    bucket_idx: &[i32],
+    grad_w: &[f32],
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_cell = thread::blockIdx_x() as usize;
+    let block_dim_u = thread::blockDim_x() as usize;
+    let block_split = thread::blockIdx_y() as usize;
+    let num_splits = thread::gridDim_y() as usize;
+    let block_buc = thread::blockIdx_z() as usize;
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let num_buc_u = num_buckets as usize;
+    let batch_u = batch as usize;
+    let per_bucket = out_dim_u * in_dim_u;
+    let cell_in_bucket = block_cell * block_dim_u + tid_local;
+    if block_buc >= num_buc_u || cell_in_bucket >= per_bucket {
+        return;
+    }
+    let oi = cell_in_bucket / in_dim_u;
+    let ii = cell_in_bucket % in_dim_u;
+    let target_buc = block_buc as i32;
+
+    let positions_per_split = batch_u.div_ceil(num_splits);
+    let split_start = block_split * positions_per_split;
+    if split_start >= batch_u {
+        return;
+    }
+    let split_end_candidate = split_start + positions_per_split;
+    let split_end = if split_end_candidate < batch_u {
+        split_end_candidate
+    } else {
+        batch_u
+    };
+
+    let mut acc = 0.0_f32;
+    let mut row = split_start;
+    while row < split_end {
+        if bucket_idx[row] == target_buc {
+            acc += x[row * in_dim_u + ii] * dy[row * out_dim_u + oi];
+        }
+        row += 1;
     }
 
     let raw = grad_w.as_ptr();

@@ -48,10 +48,36 @@ pub(crate) const DEFAULT_L2_OUT: usize = 32;
 /// trainer accepts `[2, MAX_SUPPORTED_NUM_BUCKETS]`.
 pub(crate) const DEFAULT_NUM_BUCKETS: usize = 9;
 
-/// Maximum LayerStack bucket count. Per-bucket kernels use `blockIdx.z` as the
-/// bucket axis; 256 keeps the public range bounded while leaving ample room for
-/// progress-binning experiments.
-pub(crate) const MAX_SUPPORTED_NUM_BUCKETS: usize = 256;
+/// Bucket-sort padded layout を使う `num_buckets` の上限。これを超えると
+/// `padded_sort_batch` の保守的上界が batch を凌駕し VRAM が爆発するため、
+/// direct (非 sorted) kernel 経路に切り替える。
+pub(crate) const BUCKET_SORT_MAX_N: usize = 256;
+
+/// Maximum LayerStack bucket count (`shogi_features::MAX_NUM_BUCKETS` と同値)。
+/// Per-bucket kernels use `blockIdx.z` as the bucket axis; CUDA `gridDim.z`
+/// 上限 65535 と `u16` bucket index の上限に合わせる。
+pub(crate) use shogi_features::MAX_NUM_BUCKETS as MAX_SUPPORTED_NUM_BUCKETS;
+
+const _: () = assert!(MAX_SUPPORTED_NUM_BUCKETS == shogi_features::MAX_NUM_BUCKETS);
+
+/// LayerStack の bucket-sort padded layout を使うか direct (非 sorted) 経路を使うか。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BucketLayout {
+    /// `num_buckets <= BUCKET_SORT_MAX_N`: histogram / scan / permute + sorted tiled L1。
+    Sorted,
+    /// `num_buckets > BUCKET_SORT_MAX_N`: `bucket_idx` を直接参照する kernel 経路。
+    Direct,
+}
+
+impl BucketLayout {
+    pub(crate) fn from_num_buckets(num_buckets: usize) -> Self {
+        if num_buckets <= BUCKET_SORT_MAX_N {
+            Self::Sorted
+        } else {
+            Self::Direct
+        }
+    }
+}
 
 // FT post-activation と l1_sqr の固定スケール (qa=127 量子化由来、`127.0/128.0`)。
 pub(crate) const FT_POST_SCALE: f32 = 127.0 / 128.0;

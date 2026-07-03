@@ -26,8 +26,8 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use shogi_features::{
-    ProgressBinning, ShogiProgressKPAbs, compute_quantile_thresholds, parse_progress_bin,
-    quantile_bucket, write_progress_bin_bytes,
+    MAX_NUM_BUCKETS, ProgressBinning, ShogiProgressKPAbs, compute_quantile_thresholds,
+    parse_progress_bin, quantile_bucket, write_progress_bin_bytes,
 };
 use shogi_format::PackedSfenValue;
 
@@ -60,8 +60,9 @@ struct Args {
     per_pack: bool,
 
     /// Number of progress buckets (LayerStack `--num-buckets`).
-    /// Must be in `[1, 256]` for survey; `[2, 256]` when `--write-calibrated`.
-    /// Equal-width: `floor(p * N)`. Quantile (v2 trailer): embedded thresholds.
+    /// Must be in `[1, MAX_NUM_BUCKETS]` for survey; `[2, MAX_NUM_BUCKETS]` when
+    /// `--write-calibrated`. Equal-width: `floor(p * N)`. Quantile (v2 trailer):
+    /// embedded thresholds.
     #[arg(long, default_value_t = 9)]
     num_buckets: usize,
 
@@ -140,7 +141,7 @@ fn bucket_for_survey(
     psv: &PackedSfenValue,
     num_buckets: usize,
     calibrated_thresholds: Option<&[f32]>,
-) -> u8 {
+) -> u16 {
     if let Some(thresholds) = calibrated_thresholds {
         let board = psv.decode();
         let p = kpabs.progress_board(&board);
@@ -156,9 +157,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
     let calibrating = args.write_calibrated.is_some();
     let min_buckets = if calibrating { 2 } else { 1 };
-    if !(min_buckets..=256).contains(&args.num_buckets) {
+    if !(min_buckets..=MAX_NUM_BUCKETS).contains(&args.num_buckets) {
         return Err(format!(
-            "--num-buckets must be in [{min_buckets}, 256] (got {})",
+            "--num-buckets must be in [{min_buckets}, {MAX_NUM_BUCKETS}] (got {})",
             args.num_buckets
         )
         .into());

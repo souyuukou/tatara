@@ -534,14 +534,10 @@ pub(crate) struct LayerstackArgs {
 
     /// LayerStack output bucket count. Each position is routed to bucket
     /// `min(N-1, floor(p * N))` where `p` is the progress estimate. Specify a
-    /// value in `[2, 256]`. The default 9 keeps the
-    /// binning and weight-buffer shape identical to the standard layout and
-    /// resume-compatible with existing checkpoints. The historical 8-bucket
-    /// progress emission used `floor(p * 8)` on a 9-slot layout, leaving slot 8
-    /// unused; the unified design here means setting `--num-buckets 9` (the
-    /// default) actually emits index 8 — existing 9-bucket distributed nets
-    /// have an untrained slot 8 and may see a short-term eval shift on the
-    /// `p in [8/9, 1]` tail until continued training catches up.
+    /// value in `[2, {MAX_SUPPORTED_NUM_BUCKETS}]`. Values above 256 use a
+    /// direct (non sorted) GPU path and need substantially more VRAM. The default
+    /// 9 keeps the binning and weight-buffer shape identical to the standard
+    /// layout and resume-compatible with existing checkpoints.
     #[arg(long, default_value_t = DEFAULT_NUM_BUCKETS, value_parser = parse_num_buckets)]
     pub(crate) num_buckets: usize,
 

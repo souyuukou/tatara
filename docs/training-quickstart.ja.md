@@ -74,7 +74,7 @@ target/release/nnue-train \
 | `--threads` | 16 | **必ず設定する。** GPU 処理が高速なため CPU データローダーが律速になりやすく、大き目の値を推奨。CPU 物理コア数を目安にし、小さい値 (例: 1) だと pos/s が大幅に低下する。`NNUE_TRAIN_STEP_PROFILE=1` で h2d / fwd / bwd / optimizer の内訳を確認しながら調整する |
 | `--test-tail-positions` | なし | `--data` の末尾 N 局面を同一ファイル内の held-out 検証集合として確保する (下記「held-out validation」参照)。held-out validation を有効化したいときの推奨経路 |
 | `--test-positions` | 10000 | held-out source から毎 superbatch 評価する局面数。`--test-tail-positions` または `--test-data` 指定時のみ有効 |
-| `--num-buckets` (`layerstack`) | 9 | LayerStack の output bucket 数、`[2, 9]` の整数。各局面は `min(N-1, floor(progress * N))` で routing される。低い N は bucket 1 個あたりのサンプル数が増える代わりに局面別特殊化が緩む。既定 9 は既存配布 net と同じ binning |
+| `--num-buckets` (`layerstack`) | 9 | LayerStack の output bucket 数、`[2, 65535]` の整数。各局面は `min(N-1, floor(progress * N))` で routing される。256 超は direct (非 sorted) GPU 経路となり per-bucket 重みで VRAM が大きく増える。`N > 256` の `.bin` は対応版 rshogi が必要 |
 
 `--batches-per-superbatch` (6104) / `--lr` (8.75e-4) / `--save-rate` (20)
 などは既定のままでよく、変えたいときだけ渡す。

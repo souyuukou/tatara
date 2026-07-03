@@ -456,6 +456,33 @@ mod tests {
     }
 
     #[test]
+    fn bucketed_shape_max_num_buckets_does_not_overflow() {
+        let num_buckets = shogi_features::MAX_NUM_BUCKETS;
+        let ft_out = 1536_usize;
+        let l1_out = 16_usize;
+        let l2_out = 32_usize;
+        let l1_effective = l1_out - 1;
+        let l2_in = l1_effective * 2;
+        let n = num_buckets
+            .checked_mul(l1_out)
+            .and_then(|x| x.checked_mul(ft_out))
+            .expect("l1_w elems");
+        let _ = sample(
+            WeightShape::bucketed(n, num_buckets, ft_out),
+            &LayerInit::uniform_abs(0.01, 1),
+        );
+        let n2 = num_buckets
+            .checked_mul(l2_out)
+            .and_then(|x| x.checked_mul(l2_in))
+            .expect("l2_w elems");
+        let v = sample(
+            WeightShape::bucketed(n2, num_buckets, l2_in),
+            &LayerInit::uniform_abs(0.01, 2),
+        );
+        assert_eq!(v.len(), n2);
+    }
+
+    #[test]
     fn fanin_uniform_half_width_matches_sqrt_inv_fan_in() {
         let fan_in = 73_305usize;
         let init = LayerInit::uniform_fan_in(1.0, false, 0xABCD);

@@ -25,6 +25,8 @@ fn gpu_oom_error(
     fp16_opt_state: bool,
     accumulator_flag: &str,
     accumulator_dim: usize,
+    num_buckets: usize,
+    psqt_enabled: bool,
     threat_profile: Option<&str>,
 ) -> Box<dyn std::error::Error> {
     use std::fmt::Write as _;
@@ -33,8 +35,11 @@ fn gpu_oom_error(
     let _ = write!(msg, ", {accumulator_flag}={accumulator_dim}");
     let _ = write!(
         msg,
-        ", ft-fp16={ft_fp16}, ft-fp16-out={ft_fp16_out}, fp16-opt-state={fp16_opt_state}"
+        ", num-buckets={num_buckets}, ft-fp16={ft_fp16}, ft-fp16-out={ft_fp16_out}, fp16-opt-state={fp16_opt_state}"
     );
+    if psqt_enabled {
+        msg.push_str(", psqt=enabled");
+    }
     if let Some(p) = threat_profile {
         let _ = write!(msg, ", threat-profile={p}");
     }
@@ -46,6 +51,15 @@ fn gpu_oom_error(
         msg,
         "  - lower `{accumulator_flag}` (FT 出力次元。buffer はこれに概ね線形)"
     );
+    if num_buckets > 9 {
+        let _ = writeln!(
+            msg,
+            "  - lower `--num-buckets` (per-bucket L1/L2/L3 重みと optimizer state が N に比例)"
+        );
+    }
+    if psqt_enabled {
+        msg.push_str("  - disable `--psqt` (PSQT weight は base_ft_in × num_buckets)\n");
+    }
     if matches!(threat_profile, Some(p) if p != "off") {
         msg.push_str(
             "  - smaller `--threat-profile` (full > same-class > same-class-major-pawn > cross-side、または off)\n",
@@ -53,6 +67,90 @@ fn gpu_oom_error(
     }
     msg.push_str("  - smaller `--batch-size`");
     msg.into()
+}
+
+/// LayerStack の weight + Ranger optimizer state (`m`/`v`, f32) + 任意 PSQT の
+/// 概算バイト数。FT activation / batch workspace は含まない。
+fn estimate_layerstack_persistent_bytes(
+    train_ft_in: usize,
+    ft_out: usize,
+    l1_out: usize,
+    l2_out: usize,
+    num_buckets: usize,
+    psqt_enabled: bool,
+) -> Option<u64> {
+    let l1_effective = l1_out.checked_sub(L1_SKIP)?;
+    let l2_in = l1_effective.checked_mul(2)?;
+    let mut w_elems = 0usize;
+    for n in [
+        train_ft_in.checked_mul(ft_out)?,
+        ft_out,
+        num_buckets.checked_mul(l1_out)?.checked_mul(ft_out)?,
+        num_buckets.checked_mul(l1_out)?,
+        ft_out.checked_mul(l1_out)?,
+        l1_out,
+        num_buckets.checked_mul(l2_out)?.checked_mul(l2_in)?,
+        num_buckets.checked_mul(l2_out)?,
+        num_buckets.checked_mul(l2_out)?,
+        num_buckets,
+    ] {
+        w_elems = w_elems.checked_add(n)?;
+    }
+    let w_bytes = u64::try_from(w_elems).ok()?.checked_mul(4)?;
+    // L1/L2/L3 は fp16 opt state 対象外。保守的に全 group を f32 m/v と見積もる。
+    let opt_bytes = w_bytes.checked_mul(2)?;
+    let psqt_bytes = if psqt_enabled {
+        u64::try_from(train_ft_in)
+            .ok()?
+            .checked_mul(u64::try_from(num_buckets).ok()?)?
+            .checked_mul(4)?
+            .checked_mul(3)?
+    } else {
+        0
+    };
+    w_bytes.checked_add(opt_bytes)?.checked_add(psqt_bytes)
+}
+
+/// 起動前に weight/optimizer 概算を検査し、usize オーバーフローや非現実的な
+/// サイズを CUDA alloc より前に reject する。
+fn check_layerstack_persistent_vram_budget(
+    train_ft_in: usize,
+    ft_out: usize,
+    l1_out: usize,
+    l2_out: usize,
+    num_buckets: usize,
+    psqt_enabled: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const MAX_ESTIMATE_GIB: f64 = 96.0;
+    let Some(bytes) = estimate_layerstack_persistent_bytes(
+        train_ft_in,
+        ft_out,
+        l1_out,
+        l2_out,
+        num_buckets,
+        psqt_enabled,
+    ) else {
+        return Err(
+            "LayerStack weight/optimizer buffer size overflows usize; lower --num-buckets or layer dims"
+                .into(),
+        );
+    };
+    let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    if num_buckets > BUCKET_SORT_MAX_N {
+        let psqt_suffix = if psqt_enabled { " (+PSQT)" } else { "" };
+        println!(
+            "[train] estimated LayerStack weights+optimizer{psqt_suffix}: {gib:.1} GiB \
+             (direct GPU path, num-buckets={num_buckets})"
+        );
+    }
+    if gib > MAX_ESTIMATE_GIB {
+        return Err(format!(
+            "estimated LayerStack persistent GPU memory {gib:.1} GiB exceeds {MAX_ESTIMATE_GIB:.0} GiB; \
+             lower --num-buckets, --ft-out, --l1, --l2, or disable --psqt"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -373,6 +471,15 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         None
     };
 
+    check_layerstack_persistent_vram_budget(
+        feature_set.train_ft_in(),
+        layerstack.ft_out,
+        layerstack.l1,
+        layerstack.l2,
+        layerstack.num_buckets,
+        layerstack.psqt,
+    )?;
+
     let init_spec = build_layerstack_init_spec(cli);
     // optimizer の param-group (ft / dense / bias) ごとの weight_decay と lr_mult を
     // CLI から resolve する。per-group flag 未指定の group は大域 --weight-decay と
@@ -426,6 +533,8 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 fp16_opt_state,
                 "--ft-out",
                 layerstack.ft_out,
+                layerstack.num_buckets,
+                layerstack.psqt,
                 Some(layerstack.threat_profile.as_str()),
             )
         } else {
@@ -1533,6 +1642,8 @@ pub(crate) fn run_simple_training(
                 fp16_opt_state,
                 "--l1",
                 ft_out,
+                1,
+                false,
                 None,
             )
         } else {
@@ -1763,8 +1874,10 @@ mod tests {
     #[test]
     fn gpu_oom_error_lists_relevant_remedies() {
         // fp16-opt-state off + threat on: current 値を出し、全 remedy を提示。
-        let m =
-            gpu_oom_error(65536, false, false, false, "--ft-out", 1536, Some("full")).to_string();
+        let m = gpu_oom_error(
+            65536, false, false, false, "--ft-out", 1536, 9, false, Some("full"),
+        )
+        .to_string();
         assert!(m.contains("--ft-out=1536"));
         assert!(m.contains("threat-profile=full"));
         assert!(m.contains("add `--fp16-opt-state`"));
@@ -1772,12 +1885,30 @@ mod tests {
         assert!(m.contains("smaller `--threat-profile`"));
         assert!(m.contains("smaller `--batch-size`"));
 
+        let m3 = gpu_oom_error(64, false, false, false, "--ft-out", 1536, 300, true, None)
+            .to_string();
+        assert!(m3.contains("num-buckets=300"));
+        assert!(m3.contains("lower `--num-buckets`"));
+        assert!(m3.contains("disable `--psqt`"));
+
         // fp16-opt-state 既に on + threat off (Simple): 該当しない remedy は省く。
-        let m2 = gpu_oom_error(4096, true, false, true, "--l1", 256, None).to_string();
+        let m2 = gpu_oom_error(4096, true, false, true, "--l1", 256, 1, false, None).to_string();
         assert!(m2.contains("--l1=256"));
         assert!(!m2.contains("add `--fp16-opt-state`"));
         assert!(!m2.contains("smaller `--threat-profile`"));
         assert!(m2.contains("lower `--l1`"));
         assert!(m2.contains("smaller `--batch-size`"));
+    }
+
+    #[test]
+    fn layerstack_persistent_vram_estimate_default_dims_at_max_buckets() {
+        let bytes = estimate_layerstack_persistent_bytes(73_305, 1536, 16, 32, 65_535, false)
+            .expect("65535 buckets with default dims must not overflow usize");
+        let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        assert!(
+            gib > 15.0 && gib < 30.0,
+            "expected ~22 GiB estimate, got {gib:.1} GiB"
+        );
+        assert!(check_layerstack_persistent_vram_budget(73_305, 1536, 16, 32, 65_535, false).is_ok());
     }
 }

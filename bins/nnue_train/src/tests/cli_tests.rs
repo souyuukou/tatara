@@ -51,13 +51,13 @@ fn layerstack_subcommand_parses() {
 
 #[test]
 fn num_buckets_accepts_new_range_and_rejects_boundaries() {
-    for value in [2, 9, 10, 256] {
+    for value in [2, 9, 10, 256, 257, 1024] {
         assert_eq!(
             layerstack_args(&["--num-buckets", &value.to_string()]).num_buckets,
             value
         );
     }
-    for value in [1, 257] {
+    for value in [1, 65536] {
         assert!(
             Cli::try_parse_from([
                 "nnue-train",

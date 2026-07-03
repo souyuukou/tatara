@@ -466,6 +466,12 @@ impl LayerStackWeights {
         num_buckets: usize,
     ) -> Self {
         assert!(num_buckets >= 1, "num_buckets must be >= 1");
+        if num_buckets > shogi_features::MAX_NUM_BUCKETS {
+            panic!(
+                "num_buckets {num_buckets} exceeds maximum {}",
+                shogi_features::MAX_NUM_BUCKETS
+            );
+        }
         let l2_in = (l1_out - 1) * 2;
         Self {
             feature_set,
@@ -512,6 +518,15 @@ impl LayerStackWeights {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "num_buckets must be >= 1",
+            ));
+        }
+        if num_buckets > shogi_features::MAX_NUM_BUCKETS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "num_buckets {num_buckets} exceeds maximum supported {}",
+                    shogi_features::MAX_NUM_BUCKETS
+                ),
             ));
         }
         // header の `num_buckets` field は u32。silent truncation を起こさず
@@ -859,6 +874,15 @@ impl LayerStackWeights {
             }
             v
         };
+        if file_num_buckets > shogi_features::MAX_NUM_BUCKETS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "num_buckets {file_num_buckets} exceeds maximum supported {}",
+                    shogi_features::MAX_NUM_BUCKETS
+                ),
+            ));
+        }
 
         // HandCount は未対応 (reject のまま)。Threat は `expected` の profile と
         // arch_str の `Threat={profile},` token が一致するか検証する: token 有無 /

@@ -177,17 +177,16 @@ impl ShogiProgressKPAbs {
 
     /// N-bucket 割当 (`0..=num_buckets-1`)。等幅は `floor(p × N)`、等頻度は
     /// trailer 閾値。等頻度時は `num_buckets` が trailer の N と一致必須。
-    pub fn bucket(&self, pos: &PackedSfenValue, num_buckets: usize) -> u8 {
+    pub fn bucket(&self, pos: &PackedSfenValue, num_buckets: usize) -> u16 {
         self.bucket_board(&pos.decode(), num_buckets)
     }
 
     /// `bucket` の **decode 済み `ShogiBoard` を直接受ける** 版。
-    pub fn bucket_board(&self, board: &ShogiBoard, num_buckets: usize) -> u8 {
+    pub fn bucket_board(&self, board: &ShogiBoard, num_buckets: usize) -> u16 {
         assert!(
             (1..=MAX_NUM_BUCKETS).contains(&num_buckets),
             "num_buckets must be in [1, {MAX_NUM_BUCKETS}] (got {num_buckets}); \
-             upper bound is `u8::MAX as usize + 1` so `bucket = num_buckets - 1` \
-             fits in u8"
+             upper bound is `u16::MAX` so `bucket = num_buckets - 1` fits in u16"
         );
         let p = self.progress_board(board);
         match Self::binning() {
@@ -208,9 +207,9 @@ impl ShogiProgressKPAbs {
 }
 
 /// `ShogiProgressKPAbs::bucket{,_board}` が受け付ける `num_buckets` の上限。
-/// 返り値が `u8` のため `bucket = num_buckets - 1` が `u8::MAX = 255` に収まる
-/// 256 までを許容する (LayerStack 既定 9 を含む全 production 用途に十分な margin)。
-pub const MAX_NUM_BUCKETS: usize = u8::MAX as usize + 1;
+/// 返り値が `u16` のため `bucket = num_buckets - 1` が `u16::MAX` に収まる
+/// 65535 までを許容する (CUDA per-bucket kernel の `gridDim.z` 上限と一致)。
+pub const MAX_NUM_BUCKETS: usize = u16::MAX as usize;
 
 #[cfg(test)]
 mod tests {
@@ -310,14 +309,14 @@ mod tests {
         };
         let p = ShogiProgressKPAbs;
         for n in 1..=9 {
-            let want = ((0.5_f32 * n as f32).floor() as i32).clamp(0, n as i32 - 1) as u8;
+            let want = ((0.5_f32 * n as f32).floor() as i32).clamp(0, n as i32 - 1) as u16;
             let got = p.bucket_board(&board, n);
             assert_eq!(got, want, "bucket_board mismatch for N={n}");
         }
     }
 
     #[test]
-    #[should_panic(expected = "num_buckets must be in [1, 256]")]
+    #[should_panic(expected = "num_buckets must be in [1, 65535]")]
     fn bucket_board_rejects_too_large_num_buckets() {
         let board = ShogiBoard {
             side_to_move: Color::Black,

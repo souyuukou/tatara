@@ -81,7 +81,7 @@ change for real training are:
 | `--threads` | 16 | **Always set this.** Because GPU processing is fast, the CPU dataloader is easily the bottleneck; a larger value is recommended. Use your CPU's physical core count as a starting point — a small value (e.g. 1) will cause a large drop in pos/s. Use `NNUE_TRAIN_STEP_PROFILE=1` to see the h2d / fwd / bwd / optimizer breakdown and tune accordingly |
 | `--test-tail-positions` | none | Reserve the last N positions of `--data` as a held-out validation set in the same file (see "Held-out validation" below). Recommended whenever you want held-out validation |
 | `--test-positions` | 10000 | Number of positions evaluated each superbatch from the held-out source. Used only with `--test-tail-positions` or `--test-data` |
-| `--num-buckets` (`layerstack`) | 9 | LayerStack output bucket count, an integer in `[2, 9]`. Each position is routed to `min(N-1, floor(progress * N))`. Lower values trade per-bucket specialisation for more samples per bucket; the default 9 keeps the binning identical to existing distributed nets |
+| `--num-buckets` (`layerstack`) | 9 | LayerStack output bucket count, an integer in `[2, 65535]`. Each position is routed to `min(N-1, floor(progress * N))`. Values above 256 use a direct (non sorted) GPU path and need substantially more VRAM for per-bucket weights. Nets with `N > 256` require a matching rshogi build for inference |
 
 `--batches-per-superbatch` (6104) / `--lr` (8.75e-4) / `--save-rate` (20)
 and the like can be left at their defaults; pass them only when you want to

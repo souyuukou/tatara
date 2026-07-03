@@ -38,7 +38,7 @@ vector.
 
 | Architecture | Subcommand | Structure |
 |---|---|---|
-| **LayerStack** | `layerstack` | Specializes the output layer per bucket by game progress (`--num-buckets`, default 9; the same idea as Stockfish's "LayerStacks"). FT output `--ft-out` (default 1536) → `--l1` (default 16) → `--l2` (default 32) |
+| **LayerStack** | `layerstack` | Specializes the output layer per bucket by game progress (`--num-buckets`, default 9, max 65535; the same idea as Stockfish's "LayerStacks"). FT output `--ft-out` (default 1536) → `--l1` (default 16) → `--l2` (default 32). Values above 256 use a direct GPU path and need much more VRAM; inference requires a matching rshogi build |
 | **Simple** | `simple` | A plain NNUE with no bucket split (FT → 2 hidden layers → single output). Layer dimensions are set with `--arch <l1>x2-<l2>-<l3>` (`l1` = FT output, `l2`/`l3` = hidden layers; default `256x2-32-32`); activation crelu / screlu / pairwise |
 
 ### Input feature set

@@ -43,18 +43,18 @@ impl ProgressBinning {
 
 /// `p ∈ [0, 1]` を等幅 N-bucket に割当 (`floor(p × N)` clamp)。
 #[inline]
-pub fn equal_width_bucket(p: f32, num_buckets: usize) -> u8 {
+pub fn equal_width_bucket(p: f32, num_buckets: usize) -> u16 {
     let n_i32 = num_buckets as i32;
     let raw = (p * num_buckets as f32).floor() as i32;
-    raw.clamp(0, n_i32 - 1) as u8
+    raw.clamp(0, n_i32 - 1) as u16
 }
 
 /// 等頻度閾値で `p` を bucket へ割当。`thresholds.len() == num_buckets - 1`。
 #[inline]
-pub fn quantile_bucket(p: f32, num_buckets: usize, thresholds: &[f32]) -> u8 {
+pub fn quantile_bucket(p: f32, num_buckets: usize, thresholds: &[f32]) -> u16 {
     debug_assert_eq!(thresholds.len() + 1, num_buckets);
     let bucket = thresholds.partition_point(|&t| p >= t);
-    bucket.min(num_buckets - 1) as u8
+    bucket.min(num_buckets - 1) as u16
 }
 
 /// ソート済み progress 値から等頻度閾値 `N-1` 個を導出する。
@@ -278,6 +278,27 @@ mod tests {
         assert!((thresholds[0] - ps[25]).abs() < 1e-5);
         assert!((thresholds[1] - ps[50]).abs() < 1e-5);
         assert!((thresholds[2] - ps[75]).abs() < 1e-5);
+    }
+
+    #[test]
+    fn equal_width_bucket_max_n_boundary() {
+        assert_eq!(equal_width_bucket(1.0, MAX_NUM_BUCKETS), 65534);
+    }
+
+    #[test]
+    fn v2_round_trip_max_num_buckets() {
+        let weights = dummy_weights();
+        let thresholds: Vec<f32> = (1..MAX_NUM_BUCKETS)
+            .map(|k| k as f32 / MAX_NUM_BUCKETS as f32)
+            .collect();
+        let binning = ProgressBinning::Quantile {
+            num_buckets: MAX_NUM_BUCKETS,
+            thresholds: thresholds.into_boxed_slice(),
+        };
+        let bytes = write_progress_bin_bytes(&weights, &binning).unwrap();
+        let (read_weights, read_binning) = parse_progress_bin(&bytes).unwrap();
+        assert_eq!(read_weights, weights);
+        assert_eq!(read_binning, binning);
     }
 
     #[test]

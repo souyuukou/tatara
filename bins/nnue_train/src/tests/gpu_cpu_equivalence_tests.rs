@@ -1146,6 +1146,62 @@ fn dense_mm_bwd_weight_bucket_indexed_l3_matches_cpu() -> Result<(), Box<dyn std
 }
 
 #[test]
+fn dense_mm_bwd_weight_bucket_unsorted_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    for &(batch, in_dim, out_dim, nb) in &[
+        (16_usize, 32_usize, 1_usize, 257_usize),
+        (32, 16, 4, 300),
+        (64, 30, 8, 1024),
+    ] {
+        let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
+        let dy: Vec<f32> = (0..batch * out_dim)
+            .map(|i| i as f32 * 0.013 - 0.4)
+            .collect();
+        let bucket_idx = bucket_idx_with_padding(batch, nb);
+        let mut dw_cpu = vec![0.0_f32; nb * out_dim * in_dim];
+        dense_mm_bwd_weight_bucket_cpu(
+            &x,
+            &dy,
+            &bucket_idx,
+            &mut dw_cpu,
+            batch,
+            in_dim,
+            out_dim,
+            nb,
+        );
+
+        let x_dev = DeviceBuffer::from_host(&stream, &x)?;
+        let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+        let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+        let dw_dev = DeviceBuffer::<f32>::zeroed(&stream, nb * out_dim * in_dim)?;
+        let num_splits = 8_usize;
+        let config = LaunchConfig {
+            grid_dim: (
+                (out_dim * in_dim).div_ceil(256) as u32,
+                num_splits as u32,
+                nb as u32,
+            ),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        cuda_launch! {
+            kernel: dense_mm_bwd_weight_bucket_unsorted, stream: stream, module: module,
+            config: config,
+            args: [slice(x_dev), slice(dy_dev), slice(bidx_dev), slice(dw_dev),
+                   batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+        }?;
+        stream.synchronize()?;
+        assert_close_rel(
+            &format!("dense_mm_bwd_weight_bucket_unsorted nb={nb}"),
+            &dw_dev.to_host_vec(&stream)?,
+            &dw_cpu,
+            TOL,
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn dense_mm_bwd_weight_bucket_tiled_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
     // tiled (L1): in_dim % 16 == 0、out_dim == 16、batch % 16 == 0、num_buckets == 9 を要求
@@ -2107,7 +2163,7 @@ fn simple_act_grad_to_fp16_crelu_clamp_counter_counts_overflows()
 // =============================================================================
 
 /// `--num-buckets` で実験的に使う想定の N 値。
-const NUM_BUCKETS_PARAM_VALUES: [usize; 6] = [2, 4, 8, 9, 10, 256];
+const NUM_BUCKETS_PARAM_VALUES: [usize; 8] = [2, 4, 8, 9, 10, 256, 257, 1024];
 
 #[test]
 fn dense_mm_fwd_bucket_matches_cpu_for_each_num_buckets() -> Result<(), Box<dyn std::error::Error>>
@@ -4136,4 +4192,47 @@ fn layerstack_raw_ckpt_roundtrips_without_psqt() -> Result<(), Box<dyn std::erro
 #[test]
 fn layerstack_raw_ckpt_roundtrips_with_psqt() -> Result<(), Box<dyn std::error::Error>> {
     layerstack_raw_ckpt_roundtrip(true)
+}
+
+/// sorted (`N=256`) / direct (`N=257`) 境界で 1 training step が finite loss を返す。
+fn layerstack_training_step_smoke(num_buckets: usize) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::trainer_layerstack::{GpuTrainer, OptimGroupConfig};
+    use nnue_train::init::LayerStackInit;
+    use shogi_features::FeatureSet;
+
+    let ctx = CudaContext::new(0)?;
+    let feature_set = FeatureSet::HalfKp.spec();
+    let batch_size = 64_usize;
+    let ft_out = 128_usize;
+    let mut trainer = GpuTrainer::new(
+        &ctx,
+        batch_size,
+        ft_out,
+        DEFAULT_L1_OUT,
+        DEFAULT_L2_OUT,
+        num_buckets,
+        false,
+        false,
+        false,
+        false,
+        feature_set,
+        OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
+        None,
+        None,
+        &LayerStackInit::default_uniform(),
+    )?;
+    let batch = BatchData::smoke_dummy(batch_size, feature_set);
+    let loss = trainer.step(&batch.as_ref(), 1e-3, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
+    assert!(loss.is_finite(), "num_buckets={num_buckets} loss must be finite");
+    Ok(())
+}
+
+#[test]
+fn layerstack_training_step_sorted_path_num_buckets_256() -> Result<(), Box<dyn std::error::Error>> {
+    layerstack_training_step_smoke(256)
+}
+
+#[test]
+fn layerstack_training_step_direct_path_num_buckets_257() -> Result<(), Box<dyn std::error::Error>> {
+    layerstack_training_step_smoke(257)
 }

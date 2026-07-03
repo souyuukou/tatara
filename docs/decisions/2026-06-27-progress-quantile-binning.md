@@ -30,7 +30,7 @@ v2 appends a trailer immediately after the weight block:
 |-------|------|-------|
 | magic | `[u8; 4]` | `b"PRGQ"` |
 | version | u32 LE | `1` |
-| num_buckets | u32 LE | `N ∈ [2, 256]` |
+| num_buckets | u32 LE | `N ∈ [2, 65535]` |
 | thresholds | `(N-1) × f32` LE | strictly increasing, each in `(0, 1)` |
 
 Bucket assignment: `bucket = |{ t ∈ thresholds : p >= t }|`, clamped to `N-1`.
