@@ -20,8 +20,7 @@
 //!
 //! kernel ↔ CPU ref 対応表は `gpu_kernels` 各 module の doc 参照。
 
-use cuda_host::cuda_launch;
-use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
+use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, cuda_launch};
 
 use crate::*;
 use crate::{arch::*, kernel_module::*, trainer_common::*};
@@ -78,6 +77,30 @@ fn open_module() -> Result<CudaCtxModuleStream, Box<dyn std::error::Error>> {
     let stream = ctx.default_stream();
     let module = load_kernel_module_with_fallback(&ctx, "nnue_train")?;
     Ok((ctx, module, stream))
+}
+
+#[test]
+fn launch_error_includes_kernel_name() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let x_dev = DeviceBuffer::from_host(&stream, &[0.0_f32])?;
+    let mut y_dev = DeviceBuffer::<f32>::zeroed(&stream, 1)?;
+    let error = cuda_launch! {
+        kernel: crelu_fwd,
+        stream: stream,
+        module: module,
+        config: LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (2048, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        args: [slice(x_dev), slice_mut(y_dev), 1_u32]
+    }
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("crelu_fwd"),
+        "kernel name is missing from error: {error}"
+    );
+    Ok(())
 }
 
 /// 決定論的な「面白い」値列を作る (interior / CReLU 境界 0.0・1.0 / 負 / >1 を踏む)。
@@ -654,6 +677,318 @@ fn bias_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// `simple_bias_grad_dual` (2D-grid per-output tile reduction) が `Σ_b (stm + nstm)` の CPU
+/// 参照と一致する。整数値 dft で reduction を exact 化し、items > batch (1 block) / batch 倍数 /
+/// 末尾 partial block / ft_dim 16・32・256・512・1024 (block 上限境界)・1536 (block_dim=1024、
+/// grid.y=2 で末尾 output tile が partial)・2048 (block_dim=1024、grid.y=2 で full output tile)
+/// を網羅。launch は trainer と同じ `block_dim = min(ft, 1024)`・`grid.y = ceil(ft/block_dim)`。
+#[test]
+fn simple_bias_grad_dual_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    for &(batch, ft, items) in &[
+        (5usize, 16u32, 8u32),
+        (130, 32, 64),
+        (128, 256, 64),
+        (300, 256, 64),
+        (256, 512, 64),
+        (1024, 1024, 256),
+        (200, 1536, 64),
+        (300, 2048, 64),
+    ] {
+        let n = batch * ft as usize;
+        // 整数値 (f32/f16 で exact) なので和の順序に依らず一致する。
+        let stm: Vec<f32> = (0..n).map(|i| ((i % 7) as i32 - 3) as f32).collect();
+        let nstm: Vec<f32> = (0..n).map(|i| ((i % 5) as i32 - 2) as f32).collect();
+        let mut gb_cpu = vec![0.0_f32; ft as usize];
+        for b in 0..batch {
+            let row = &stm[b * ft as usize..(b + 1) * ft as usize];
+            let nrow = &nstm[b * ft as usize..(b + 1) * ft as usize];
+            for (g, (s, n)) in gb_cpu.iter_mut().zip(row.iter().zip(nrow)) {
+                *g += *s + *n;
+            }
+        }
+        let stm_dev = DeviceBuffer::from_host(&stream, &stm)?;
+        let nstm_dev = DeviceBuffer::from_host(&stream, &nstm)?;
+        let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, ft as usize)?;
+        let blocks = (batch as u32).div_ceil(items);
+        let block_dim = ft.min(1024);
+        let out_tiles = ft.div_ceil(block_dim);
+        cuda_launch! {
+            kernel: simple_bias_grad_dual, stream: stream, module: module,
+            config: LaunchConfig { grid_dim: (blocks, out_tiles, 1), block_dim: (block_dim, 1, 1), shared_mem_bytes: 0 },
+            args: [slice(stm_dev), slice(nstm_dev), slice(gb_dev), batch as u32, ft, items]
+        }?;
+        stream.synchronize()?;
+        assert_close_rel(
+            &format!("simple_bias_grad_dual b={batch} ft={ft} items={items}"),
+            &gb_dev.to_host_vec(&stream)?,
+            &gb_cpu,
+            TOL,
+        );
+    }
+    Ok(())
+}
+
+/// `simple_bias_grad_dual_fp16` (FP16 入力 + `dft_inv_scale`) が CPU 参照と一致する。
+/// 整数値 dft × scale=0.5 (f16/f32 で exact) で reduction を exact 化。ft_dim 1536 (partial
+/// output tile) / 2048 で 2D-grid (`block_dim = min(ft, 1024)`・`grid.y > 1`) 経路も網羅。
+#[test]
+fn simple_bias_grad_dual_fp16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let scale = 0.5_f32;
+    for &(batch, ft, items) in &[
+        (5usize, 16u32, 8u32),
+        (130, 256, 64),
+        (128, 256, 64),
+        (256, 512, 64),
+        (200, 1536, 64),
+        (300, 2048, 64),
+    ] {
+        let n = batch * ft as usize;
+        let stm_f: Vec<f32> = (0..n).map(|i| ((i % 7) as i32 - 3) as f32).collect();
+        let nstm_f: Vec<f32> = (0..n).map(|i| ((i % 5) as i32 - 2) as f32).collect();
+        let (stm_h, stm_rt) = quantize_f16(&stm_f);
+        let (nstm_h, nstm_rt) = quantize_f16(&nstm_f);
+        let mut gb_cpu = vec![0.0_f32; ft as usize];
+        for b in 0..batch {
+            let row = &stm_rt[b * ft as usize..(b + 1) * ft as usize];
+            let nrow = &nstm_rt[b * ft as usize..(b + 1) * ft as usize];
+            for (g, (s, n)) in gb_cpu.iter_mut().zip(row.iter().zip(nrow)) {
+                *g += *s * scale + *n * scale;
+            }
+        }
+        let stm_dev = DeviceBuffer::from_host(&stream, &stm_h)?;
+        let nstm_dev = DeviceBuffer::from_host(&stream, &nstm_h)?;
+        let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, ft as usize)?;
+        let blocks = (batch as u32).div_ceil(items);
+        let block_dim = ft.min(1024);
+        let out_tiles = ft.div_ceil(block_dim);
+        cuda_launch! {
+            kernel: simple_bias_grad_dual_fp16, stream: stream, module: module,
+            config: LaunchConfig { grid_dim: (blocks, out_tiles, 1), block_dim: (block_dim, 1, 1), shared_mem_bytes: 0 },
+            args: [slice(stm_dev), slice(nstm_dev), slice(gb_dev), batch as u32, ft, scale, items]
+        }?;
+        stream.synchronize()?;
+        assert_close_rel(
+            &format!("simple_bias_grad_dual_fp16 b={batch} ft={ft} items={items}"),
+            &gb_dev.to_host_vec(&stream)?,
+            &gb_cpu,
+            TOL,
+        );
+    }
+    Ok(())
+}
+
+/// FT bias grad の 2D-grid 化で ft_out > 1024 の CReLU / SCReLU が `SimpleGpuTrainer::new` で
+/// reject されず、trainer の backward 経路 (`simple_bias_grad_dual[_fp16]` の grid.y > 1 launch
+/// を含む) が step 後に finite な weight を生成することを確認する。ft_out=1536 は
+/// `block_dim = min(ft, 1024) = 1024`・`grid.y = ceil(1536/1024) = 2` で末尾 output tile が
+/// partial (oi 1024..1535 valid、1536..2047 padding) になる boundary。CReLU/SCReLU ×
+/// FP32/FP16-out 経路を網羅する。
+#[test]
+fn simple_trainer_ft_out_gt_1024_steps() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::trainer_simple::SimpleGpuTrainer;
+    use nnue_format::{SimpleActivation, SimpleId};
+    use nnue_train::init::SimpleInit;
+    use shogi_features::FeatureSet;
+
+    let ctx = CudaContext::new(0)?;
+    let init = SimpleInit::default_uniform();
+    let ft_out = 1536_usize;
+    for activation in [SimpleActivation::CReLU, SimpleActivation::SCReLU] {
+        for &(ft_fp16, ft_fp16_out) in &[(false, false), (true, true)] {
+            let id = SimpleId {
+                feature_set: FeatureSet::HalfKaHmMerged.spec(),
+                activation,
+                ft_out,
+                l1_out: 32,
+                l2_out: 32,
+            };
+            let mut trainer = SimpleGpuTrainer::new(
+                &ctx,
+                SMOKE_BATCH,
+                id,
+                1e-7,
+                16,
+                PrecisionFlags {
+                    ft_fp16,
+                    ft_fp16_out,
+                    fp16_opt_state: false,
+                    tf32: false,
+                },
+                &init,
+            )?;
+            // smoke_dummy は target=0.5 近傍で学習信号が無いため score / wdl を動かす
+            // (backward が走り finite な grad を出すことを見るので値は任意の非ゼロでよい)。
+            let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
+            for s in batch.score.iter_mut() {
+                *s = 200.0;
+            }
+            for w in batch.wdl.iter_mut() {
+                *w = 0.8;
+            }
+            // step の戻り値 loss は更新前 weight の forward 値なので、backward (2D bias grad
+            // launch) が NaN/Inf を出してもこれ単体では捕捉できない。optimizer 適用後に全
+            // weight (2D grad で更新される ft_b を含む) が finite であることで backward 出力の
+            // 健全性を確認する。
+            let loss = trainer.step(&batch.as_ref(), 1e-1, 0.0, SMOKE_LOSS_SIGMOID)?;
+            assert!(
+                loss.is_finite(),
+                "ft_out={ft_out} {} ft_fp16_out={ft_fp16_out}: forward loss {loss} not finite",
+                activation.canonical_name(),
+            );
+            trainer.assert_all_weights_finite().map_err(|e| {
+                format!(
+                    "ft_out={ft_out} {} ft_fp16_out={ft_fp16_out}: non-finite weight after step: {e}",
+                    activation.canonical_name(),
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// `dense_bias_grad_tiled` (grid-stride per-column register 累積 + shared-mem tree reduction)
+/// が `Σ_b dy[b][oi]` の CPU 参照と一致する。dy を整数値かつ全部分和が 2^24 未満 (各
+/// |dy| <= 6) に収め、f32 加算を exact・順序非依存にして **bit 一致** で検証する。
+/// grid-stride の partial (grid*R が batch を割り切らない) / idle thread (grid*R > batch) /
+/// 単一 block grid-stride / R=1 (reduction loop skip) ・2・4・8・16・256 / out_dim
+/// 1・16・32・64・128・256 (block_dim 上限) を網羅。末尾は本番 helper `cfg_dense_bias_grad`
+/// の config でも一致することを確認する。
+#[test]
+fn dense_bias_grad_tiled_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (ctx, module, stream) = open_module()?;
+    let occ = DeviceOccupancy::query(&ctx)?;
+    // (batch, out_dim, grid, R): block_dim = R * out_dim、R は 2 冪。
+    for &(batch, out_dim, grid, r) in &[
+        (5usize, 1u32, 2u32, 4u32), // idle threads (grid*R=8 > batch)、out=1
+        (1000, 1, 1, 256),          // 単一 block grid-stride、out=1
+        (1000, 1, 7, 256),          // idle threads、out=1 reduction
+        (5, 16, 1, 8),              // 小 batch、out=16
+        (300, 16, 4, 16),           // R=16、partial
+        (130, 32, 3, 8),            // partial (130 % (grid*R=24) != 0)、out=32
+        (256, 64, 5, 4),            // out=64、R=4
+        (300, 128, 4, 2),           // out=128、R=2 (tree reduction 1 step)
+        (513, 256, 3, 1),           // out=256、R=1 (reduction loop skip、block_dim 上限)
+        (4096, 32, 240, 8),         // 多 block、out=32
+        (65536, 1, 240, 256),       // 本番 L3 shape
+        (65536, 32, 240, 8),        // 本番 L1/L2 shape
+    ] {
+        let n = batch * out_dim as usize;
+        let dy: Vec<f32> = (0..n).map(|i| ((i % 13) as i32 - 6) as f32).collect();
+        let mut gb_cpu = vec![0.0_f32; out_dim as usize];
+        bias_grad_cpu(&dy, &mut gb_cpu, batch, out_dim as usize);
+
+        let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+        let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, out_dim as usize)?;
+        let block = r * out_dim;
+        cuda_launch! {
+            kernel: dense_bias_grad_tiled, stream: stream, module: module,
+            config: LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 },
+            args: [slice(dy_dev), slice(gb_dev), batch as u32, out_dim]
+        }?;
+        stream.synchronize()?;
+        assert_eq!(
+            gb_dev.to_host_vec(&stream)?,
+            gb_cpu,
+            "dense_bias_grad_tiled b={batch} out={out_dim} grid={grid} r={r}"
+        );
+    }
+
+    for &(batch, out_dim) in &[(65536u32, 1u32), (65536, 32), (4096, 32), (1024, 256)] {
+        let n = batch as usize * out_dim as usize;
+        let dy: Vec<f32> = (0..n).map(|i| ((i % 13) as i32 - 6) as f32).collect();
+        let mut gb_cpu = vec![0.0_f32; out_dim as usize];
+        bias_grad_cpu(&dy, &mut gb_cpu, batch as usize, out_dim as usize);
+        let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+        let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, out_dim as usize)?;
+        cuda_launch! {
+            kernel: dense_bias_grad_tiled, stream: stream, module: module,
+            config: cfg_dense_bias_grad(occ, batch, out_dim),
+            args: [slice(dy_dev), slice(gb_dev), batch, out_dim]
+        }?;
+        stream.synchronize()?;
+        assert_eq!(
+            gb_dev.to_host_vec(&stream)?,
+            gb_cpu,
+            "dense_bias_grad_tiled(helper) b={batch} out={out_dim}"
+        );
+    }
+    Ok(())
+}
+
+/// `cfg_dense_bias_grad` の launch geometry を検証する。out_dim の全許容域 (1..=256) で
+/// kernel の構造不変条件 (`block_dim <= DENSE_BIAS_GRAD_MAX_OUT`、`block_dim % out_dim == 0`、
+/// `R = block_dim / out_dim` は 2 冪) を満たし、かつ grid が
+/// `min(ceil(batch / R), sm_count * floor(max_threads_per_sm / block_dim))` と**厳密一致**
+/// すること (固定値や定数 1 へ縮退する回帰を弾く) を、SM 数の異なる複数 device 形状で
+/// 確認する。構造不変条件を破ると kernel が shared `PARTIAL` を OOB write し得る (caller は
+/// out_dim > 256 で generic `bias_grad` に fall back する)。
+#[test]
+fn cfg_dense_bias_grad_invariants() {
+    const BATCH: u32 = 65536;
+    // (sm_count, max_threads_per_sm): RTX 3080 Ti / RTX 5090 (どちらも実測値) / 極小 SM。
+    for &(sm_count, max_threads_per_sm) in &[(80u32, 1536u32), (170, 1536), (1, 1536)] {
+        let occ = DeviceOccupancy::from_counts(sm_count, max_threads_per_sm);
+        for out_dim in 1..=DENSE_BIAS_GRAD_MAX_OUT {
+            let cfg = cfg_dense_bias_grad(occ, BATCH, out_dim);
+            let block = cfg.block_dim.0;
+            let grid = cfg.grid_dim.0;
+            assert!(
+                block <= DENSE_BIAS_GRAD_MAX_OUT,
+                "out_dim={out_dim} block={block} exceeds shared PARTIAL capacity"
+            );
+            assert_eq!(
+                block % out_dim,
+                0,
+                "out_dim={out_dim} block={block} not divisible"
+            );
+            let r = block / out_dim;
+            assert!(
+                r.is_power_of_two(),
+                "out_dim={out_dim} R={r} not power of two"
+            );
+            // R は floor(MAX/out_dim) を超えない最大 2 冪であること (R=1 へ縮退して occupancy を
+            // 落とす実装を弾く)。cap は out_dim in 1..=256 で >= 1。
+            let cap = DENSE_BIAS_GRAD_MAX_OUT / out_dim;
+            assert!(
+                r <= cap && 2 * r > cap,
+                "out_dim={out_dim} R={r} not largest pow2 <= {cap}"
+            );
+            // grid は formula 値と厳密一致する (定数や SM 非依存の固定値へ縮退しない
+            // ことを保証)。SM 占有を埋める cap と batch 被覆 cap の小さい方。oracle は
+            // 本番 `DeviceOccupancy::fill_blocks` と同じ境界条件 (block.max(1) / per_sm.max(1) /
+            // saturating_mul / 全体 max(1)) で計算し、`clamp(1, fill)` が `min > max` で panic
+            // しない・overflow しないことを保証する。
+            let per_sm = (max_threads_per_sm / block.max(1)).max(1);
+            let fill = sm_count.saturating_mul(per_sm).max(1);
+            let expected = BATCH.div_ceil(r).clamp(1, fill);
+            assert_eq!(
+                grid, expected,
+                "sm={sm_count} out_dim={out_dim} grid={grid} != expected {expected}"
+            );
+        }
+    }
+
+    // 文書化した代表 shape の grid を直接固定する (実機 launch geometry の回帰ガード)。
+    let occ_3080ti = DeviceOccupancy::from_counts(80, 1536);
+    let occ_5090 = DeviceOccupancy::from_counts(170, 1536);
+    // L1/L2 (out_dim=32, block_dim=256): SM 占有 cap = sm * floor(1536/256) = sm * 6。
+    // 3080 Ti = 480、5090 = 1020。
+    assert_eq!(cfg_dense_bias_grad(occ_3080ti, BATCH, 32).grid_dim.0, 480);
+    assert_eq!(cfg_dense_bias_grad(occ_5090, BATCH, 32).grid_dim.0, 1020);
+    // L3 (out_dim=1, block_dim=256): R=256 で batch 被覆 cap = ceil(65536/256) = 256 が
+    // SM cap より小さく、どちらの device も 256 (batch 律速で不変)。
+    assert_eq!(cfg_dense_bias_grad(occ_3080ti, BATCH, 1).grid_dim.0, 256);
+    assert_eq!(cfg_dense_bias_grad(occ_5090, BATCH, 1).grid_dim.0, 256);
+    // SM 数が増えれば cap も比例して上がる (特定 GPU 固定値へ縮退しないことの明示確認)。
+    assert!(
+        cfg_dense_bias_grad(occ_5090, BATCH, 32).grid_dim.0
+            > cfg_dense_bias_grad(occ_3080ti, BATCH, 32).grid_dim.0,
+        "larger SM count must raise the grid cap"
+    );
+}
+
 /// `bias_grad_shared_l1f` (block-shared reduce 版) が `bias_grad_cpu` と reduction
 /// tolerance 内で一致することを確認。out_dim (= l1_out) を 16 / 16 倍数 / 非倍数 /
 /// 上限 256 で網羅する。
@@ -935,6 +1270,117 @@ fn bucket_sort_fwd_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn bucket_sort_bwd_input_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    // out_dim は 16 幅 K-tile で消化する (16 / 16 倍数 / 非倍数を網羅)。in_dim % 16 == 0 が契約。
+    for &(batch, in_dim, out_dim) in &[
+        (16_usize, 16_usize, 16_usize),
+        (32, 64, 32),
+        (48, 96, 24),
+        (64, 32, 8),
+        (32, 48, 17),
+    ] {
+        let nb = DEFAULT_NUM_BUCKETS;
+        let padded = padded_sort_batch(batch, nb);
+        let dy: Vec<f32> = (0..batch * out_dim)
+            .map(|i| i as f32 * 0.013 - 0.4)
+            .collect();
+        let w: Vec<f32> = (0..nb * out_dim * in_dim)
+            .map(|i| i as f32 * 0.0007 + 0.05)
+            .collect();
+        let bucket_idx = bucket_idx_with_padding(batch, nb);
+
+        let mut dx_cpu = vec![0.0_f32; batch * in_dim];
+        dense_mm_bwd_input_bucket_cpu(
+            &dy,
+            &w,
+            &bucket_idx,
+            &mut dx_cpu,
+            batch,
+            in_dim,
+            out_dim,
+            nb,
+        );
+
+        let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+        let w_dev = DeviceBuffer::from_host(&stream, &w)?;
+        let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+
+        let counts_dev = DeviceBuffer::<u32>::zeroed(&stream, nb + 1)?;
+        let offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, nb + 1)?;
+        let write_ctr_dev = DeviceBuffer::<u32>::zeroed(&stream, nb + 1)?;
+        let perm_dev = DeviceBuffer::<i32>::zeroed(&stream, padded)?;
+        let bidx_sorted_dev = DeviceBuffer::<i32>::zeroed(&stream, padded)?;
+        let mut dy_sorted_dev = DeviceBuffer::<f32>::zeroed(&stream, padded * out_dim)?;
+        let mut dx_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * in_dim)?;
+
+        memset_minus_one_i32(&stream, &perm_dev)?;
+        memset_minus_one_i32(&stream, &bidx_sorted_dev)?;
+
+        cuda_launch! {
+            kernel: count_buckets, stream: stream, module: module,
+            config: cfg_1d(batch),
+            args: [slice(bidx_dev), slice(counts_dev), batch as u32, nb as u32]
+        }?;
+        cuda_launch! {
+            kernel: exclusive_scan_aligned, stream: stream, module: module,
+            config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 },
+            args: [slice(counts_dev), slice(offsets_dev), (nb + 1) as u32, 16_u32]
+        }?;
+        cuda_launch! {
+            kernel: scatter_bucket_perm, stream: stream, module: module,
+            config: cfg_1d(batch),
+            args: [slice(bidx_dev), slice(offsets_dev), slice(write_ctr_dev),
+                   slice(perm_dev), slice(bidx_sorted_dev), batch as u32, nb as u32]
+        }?;
+        cuda_launch! {
+            kernel: permute_rows_f32, stream: stream, module: module,
+            config: cfg_1d(padded * out_dim),
+            args: [slice(dy_dev), slice(perm_dev), slice_mut(dy_sorted_dev),
+                   padded as u32, out_dim as u32]
+        }?;
+        // sorted で計算した dx を perm で original order に直接 scatter して dx_dev へ書く。
+        // 下の CPU 参照 / 非 tiled kernel との一致で scatter 込みの値が正しいことを確認する。
+        cuda_launch! {
+            kernel: dense_mm_bwd_input_bucket_tiled_sorted_scatter, stream: stream, module: module,
+            config: LaunchConfig {
+                grid_dim: ((in_dim / 16) as u32, (padded / 16) as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            args: [slice(dy_sorted_dev), slice(w_dev), slice(bidx_sorted_dev), slice(perm_dev),
+                   slice_mut(dx_dev), padded as u32, in_dim as u32, out_dim as u32, nb as u32]
+        }?;
+        stream.synchronize()?;
+
+        let tiled_host = dx_dev.to_host_vec(&stream)?;
+        assert_close_rel(
+            &format!("bucket_sort_bwd_input_l1 b={batch} in={in_dim} out={out_dim}"),
+            &tiled_host,
+            &dx_cpu,
+            TOL_FMA,
+        );
+        // 非 tiled `dense_mm_bwd_input_bucket` と GPU 上で bit-exact (同 dy/w・同 o-order の FMA、
+        // sort/inverse-permute は値を変えない gather/scatter)。tiled 化が数値経路を変えないことを
+        // CPU tolerance ではなく完全一致で裏付ける。
+        let mut dx_nontiled_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * in_dim)?;
+        cuda_launch! {
+            kernel: dense_mm_bwd_input_bucket, stream: stream, module: module,
+            config: cfg_1d(batch * in_dim),
+            args: [slice(dy_dev), slice(w_dev), slice(bidx_dev), slice_mut(dx_nontiled_dev),
+                   batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+        }?;
+        stream.synchronize()?;
+        assert_eq!(
+            tiled_host,
+            dx_nontiled_dev.to_host_vec(&stream)?,
+            "tiled vs non-tiled bit-exact b={batch} in={in_dim} out={out_dim}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn dense_mm_bwd_input_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
     let batch = 13_usize;
@@ -1174,6 +1620,7 @@ fn dense_mm_bwd_weight_bucket_unsorted_matches_cpu() -> Result<(), Box<dyn std::
         let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
         let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
         let dw_dev = DeviceBuffer::<f32>::zeroed(&stream, nb * out_dim * in_dim)?;
+
         let num_splits = 8_usize;
         let config = LaunchConfig {
             grid_dim: (
@@ -2023,6 +2470,7 @@ fn simple_bias_act_fwd_fp16_in_screlu_matches_cpu() -> Result<(), Box<dyn std::e
         kernel: simple_bias_act_fwd_fp16_in_screlu, stream: stream, module: module,
         config: cfg_1d(batch * ft_dim),
         args: [slice(ft_out_dev), slice(bias_dev), slice_mut(acted_dev),
+               ft_dim as u32, 0_u32,
                batch as u32, ft_dim as u32]
     }?;
     stream.synchronize()?;
@@ -2076,6 +2524,7 @@ fn simple_act_grad_to_fp16_screlu_with_scale_matches_cpu() -> Result<(), Box<dyn
         kernel: simple_act_grad_to_fp16_screlu_with_scale, stream: stream, module: module,
         config: cfg_1d(batch * ft_dim),
         args: [slice(ft_out_dev), slice(bias_dev), slice(dft_acted_dev),
+               ft_dim as u32, 0_u32,
                slice_mut(dft_out_dev), slice(clamp_counter_dev),
                batch as u32, ft_dim as u32, dft_scale]
     }?;
@@ -2124,6 +2573,7 @@ fn simple_act_grad_to_fp16_crelu_clamp_counter_counts_overflows()
         kernel: simple_act_grad_to_fp16_crelu_with_scale, stream: stream, module: module,
         config: cfg_1d(batch * ft_dim),
         args: [slice(ft_out_dev), slice(bias_dev), slice(dft_acted_dev),
+               ft_dim as u32, 0_u32,
                slice_mut(dft_out_dev), slice(clamp_counter_dev),
                batch as u32, ft_dim as u32, dft_scale]
     }?;
@@ -2139,6 +2589,7 @@ fn simple_act_grad_to_fp16_crelu_clamp_counter_counts_overflows()
         kernel: simple_act_grad_to_fp16_crelu_with_scale, stream: stream, module: module,
         config: cfg_1d(batch * ft_dim),
         args: [slice(ft_out_dev), slice(bias_dev), slice(dft_acted_dev),
+               ft_dim as u32, 0_u32,
                slice_mut(dft_out_dev), slice(clamp_counter_dev),
                batch as u32, ft_dim as u32, dft_scale]
     }?;
@@ -2494,6 +2945,153 @@ fn loss_wrm_extended_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     assert!(
         diff <= 2e-4 * (1.0 + loss_cpu.abs()),
         "loss_wrm/extended loss: gpu={loss_gpu} cpu={loss_cpu} diff={diff}"
+    );
+    Ok(())
+}
+
+/// `loss_wrm` の loss_acc 集約が **複数 block** (grid > 1) を跨いで正しく総和されることを確認する。
+/// 各 block は block 内 reduction の結果を 1 atomic で寄与するため、ある block の総和が欠けると
+/// loss は `loss/num_blocks` 規模でずれる (本テストが検出)。b=1000 で grid=4 block (block 256)、
+/// 末尾 block は partial (1000 % 256 != 0、out-of-range thread は寄与 0)。grad (per-position) も
+/// CPU 参照と一致することを併せて検証する (extended=0)。
+#[test]
+fn loss_wrm_default_multiblock_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let b = 1000usize;
+    let out: Vec<f32> = (0..b).map(|i| ((i % 41) as f32 - 20.0) * 0.05).collect();
+    let score: Vec<f32> = (0..b).map(|i| ((i % 401) as f32 - 200.0) * 5.0).collect();
+    let wdl: Vec<f32> = (0..b).map(|i| (i % 3) as f32 * 0.5).collect();
+    let per_pos_norm = 1.0_f32 / b as f32;
+    let lambda = 0.0_f32;
+
+    let mut dl_cpu = vec![0.0_f32; b];
+    let mut loss_cpu = 0.0_f64;
+    loss_wrm_cpu(
+        &out,
+        &score,
+        &wdl,
+        &vec![per_pos_norm; b],
+        &mut dl_cpu,
+        &mut loss_cpu,
+        lambda,
+        WRM_NNUE2SCORE,
+        WRM_IN_SCALING,
+        WRM_IN_OFFSET,
+        WRM_TARGET_OFFSET,
+        WRM_TARGET_SCALING,
+        2.0,
+        0.0,
+        0.0,
+        0.5,
+        false,
+        b,
+    );
+
+    let out_dev = DeviceBuffer::from_host(&stream, &out)?;
+    let score_dev = DeviceBuffer::from_host(&stream, &score)?;
+    let wdl_dev = DeviceBuffer::from_host(&stream, &wdl)?;
+    let mut dl_dev = DeviceBuffer::<f32>::zeroed(&stream, b)?;
+    let loss_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    let sum_w_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    cuda_launch! {
+        kernel: loss_wrm, stream: stream, module: module, config: cfg_1d(b),
+        args: [
+            slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
+            slice_mut(dl_dev), slice(loss_dev), lambda,
+            WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
+            2.0_f32, 0.0_f32, 0.0_f32, 0.5_f32, slice(sum_w_dev), 0_u32, b as u32
+        ]
+    }?;
+    stream.synchronize()?;
+    assert_close_rel(
+        "loss_wrm/multiblock grad",
+        &dl_dev.to_host_vec(&stream)?,
+        &dl_cpu,
+        1e-4,
+    );
+    let loss_gpu = loss_dev.to_host_vec(&stream)?[0];
+    let diff = (loss_gpu - loss_cpu).abs();
+    assert!(
+        diff <= 1e-4 * (1.0 + loss_cpu.abs()),
+        "loss_wrm/multiblock loss: gpu={loss_gpu} cpu={loss_cpu} diff={diff}"
+    );
+    Ok(())
+}
+
+/// extended 経路 (`extended=1`) の loss_acc 集約を **複数 block** で検証する。`wrm_weight_sum`
+/// で Σw を先に reduce し、`loss_wrm` が `L_i·w_i·n/Σw` を block 跨ぎで総和する経路を b=1000
+/// (grid 4 block、末尾 partial) で CPU 参照と比較する。
+#[test]
+fn loss_wrm_extended_multiblock_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let b = 1000usize;
+    let out: Vec<f32> = (0..b).map(|i| ((i % 37) as f32 - 18.0) * 0.06).collect();
+    let score: Vec<f32> = (0..b).map(|i| ((i % 433) as f32 - 216.0) * 6.0).collect();
+    let wdl: Vec<f32> = (0..b).map(|i| (i % 3) as f32 * 0.5).collect();
+    let per_pos_norm = 1.0_f32 / b as f32;
+    let lambda = 0.0_f32;
+    let pow_exp = 2.5_f32;
+    let qp = 0.3_f32;
+    let w1 = 1.0_f32;
+    let w2 = 0.5_f32;
+
+    let mut dl_cpu = vec![0.0_f32; b];
+    let mut loss_cpu = 0.0_f64;
+    loss_wrm_cpu(
+        &out,
+        &score,
+        &wdl,
+        &vec![per_pos_norm; b],
+        &mut dl_cpu,
+        &mut loss_cpu,
+        lambda,
+        WRM_NNUE2SCORE,
+        WRM_IN_SCALING,
+        WRM_IN_OFFSET,
+        WRM_TARGET_OFFSET,
+        WRM_TARGET_SCALING,
+        pow_exp,
+        qp,
+        w1,
+        w2,
+        true,
+        b,
+    );
+
+    let out_dev = DeviceBuffer::from_host(&stream, &out)?;
+    let score_dev = DeviceBuffer::from_host(&stream, &score)?;
+    let wdl_dev = DeviceBuffer::from_host(&stream, &wdl)?;
+    let mut dl_dev = DeviceBuffer::<f32>::zeroed(&stream, b)?;
+    let loss_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    let sum_w_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    cuda_launch! {
+        kernel: wrm_weight_sum, stream: stream, module: module, config: cfg_1d(b),
+        args: [
+            slice(score_dev), slice(sum_w_dev), w1, w2,
+            WRM_TARGET_OFFSET, WRM_TARGET_SCALING, b as u32
+        ]
+    }?;
+    cuda_launch! {
+        kernel: loss_wrm, stream: stream, module: module, config: cfg_1d(b),
+        args: [
+            slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
+            slice_mut(dl_dev), slice(loss_dev), lambda,
+            WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
+            pow_exp, qp, w1, w2, slice(sum_w_dev), 1_u32, b as u32
+        ]
+    }?;
+    stream.synchronize()?;
+    assert_close_rel(
+        "loss_wrm/extended-multiblock grad",
+        &dl_dev.to_host_vec(&stream)?,
+        &dl_cpu,
+        2e-4,
+    );
+    let loss_gpu = loss_dev.to_host_vec(&stream)?[0];
+    let diff = (loss_gpu - loss_cpu).abs();
+    assert!(
+        diff <= 2e-4 * (1.0 + loss_cpu.abs()),
+        "loss_wrm/extended-multiblock loss: gpu={loss_gpu} cpu={loss_cpu} diff={diff}"
     );
     Ok(())
 }
@@ -2941,6 +3539,64 @@ fn exclusive_prefix_sum_small_matches_cpu() -> Result<(), Box<dyn std::error::Er
             offsets_dev.to_host_vec(&stream)?,
             offsets_cpu,
             "exclusive_prefix_sum_small n={n}"
+        );
+    }
+    Ok(())
+}
+
+/// multi-block exclusive scan (`prefix_sum_block_local` → `exclusive_prefix_sum_small`
+/// → `prefix_sum_add_block_offset`) が単一 block scan と同じ exclusive prefix sum を
+/// 出す。1024 倍数でない n / block 跨ぎ / 末尾 partial block を含めて u32 完全一致を照合。
+#[test]
+fn prefix_sum_multiblock_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    // `small` は典型的な per-feature occurrence count、`large` は full-range u32 で
+    // exclusive sum が 2^32 を跨ぐパターン (加算が順序非依存 = overflow 下でも分解と
+    // 単一 block scan が一致することを確認)。n は block 境界 / 末尾 partial /
+    // exact-multiple multi-block を網羅。
+    let small: fn(usize) -> u32 = |i| ((i * 13 + 5) % 7) as u32;
+    let large: fn(usize) -> u32 = |i| (i as u32).wrapping_mul(2_654_435_761);
+    for &(n, gen_fn) in &[
+        (1_usize, small),
+        (1023, small),
+        (1024, small),
+        (1025, small),
+        (2048, small),
+        (4096, small),
+        (73_305, small),
+        (125_388, small),
+        (125_388, large),
+    ] {
+        let counts: Vec<u32> = (0..n).map(gen_fn).collect();
+        let mut offsets_cpu = vec![0_u32; n + 1];
+        for i in 0..n {
+            offsets_cpu[i + 1] = offsets_cpu[i].wrapping_add(counts[i]);
+        }
+        let num_blocks = n.div_ceil(1024);
+        let counts_dev = DeviceBuffer::from_host(&stream, &counts)?;
+        let offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, n + 1)?;
+        let block_sums_dev = DeviceBuffer::<u32>::zeroed(&stream, num_blocks)?;
+        let block_offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, num_blocks + 1)?;
+        cuda_launch! {
+            kernel: prefix_sum_block_local, stream: stream, module: module,
+            config: LaunchConfig { grid_dim: (num_blocks as u32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
+            args: [slice(counts_dev), slice(offsets_dev), slice(block_sums_dev), n as u32]
+        }?;
+        cuda_launch! {
+            kernel: exclusive_prefix_sum_small, stream: stream, module: module,
+            config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
+            args: [slice(block_sums_dev), slice(block_offsets_dev), num_blocks as u32]
+        }?;
+        cuda_launch! {
+            kernel: prefix_sum_add_block_offset, stream: stream, module: module,
+            config: LaunchConfig { grid_dim: (num_blocks as u32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
+            args: [slice(offsets_dev), slice(block_offsets_dev), n as u32, num_blocks as u32]
+        }?;
+        stream.synchronize()?;
+        assert_eq!(
+            offsets_dev.to_host_vec(&stream)?,
+            offsets_cpu,
+            "prefix_sum_multiblock n={n}"
         );
     }
     Ok(())
@@ -4109,10 +4765,7 @@ fn layerstack_raw_ckpt_roundtrip(with_psqt: bool) -> Result<(), Box<dyn std::err
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
             DEFAULT_NUM_BUCKETS,
-            false,
-            false,
-            false,
-            false,
+            PrecisionFlags::default(),
             feature_set,
             OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
             None,
@@ -4223,16 +4876,21 @@ fn layerstack_training_step_smoke(num_buckets: usize) -> Result<(), Box<dyn std:
     )?;
     let batch = BatchData::smoke_dummy(batch_size, feature_set);
     let loss = trainer.step(&batch.as_ref(), 1e-3, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
-    assert!(loss.is_finite(), "num_buckets={num_buckets} loss must be finite");
+    assert!(
+        loss.is_finite(),
+        "num_buckets={num_buckets} loss must be finite"
+    );
     Ok(())
 }
 
 #[test]
-fn layerstack_training_step_sorted_path_num_buckets_256() -> Result<(), Box<dyn std::error::Error>> {
+fn layerstack_training_step_sorted_path_num_buckets_256() -> Result<(), Box<dyn std::error::Error>>
+{
     layerstack_training_step_smoke(256)
 }
 
 #[test]
-fn layerstack_training_step_direct_path_num_buckets_257() -> Result<(), Box<dyn std::error::Error>> {
+fn layerstack_training_step_direct_path_num_buckets_257() -> Result<(), Box<dyn std::error::Error>>
+{
     layerstack_training_step_smoke(257)
 }

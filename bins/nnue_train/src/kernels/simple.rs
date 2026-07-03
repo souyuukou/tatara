@@ -1,24 +1,26 @@
 //! Simple アーキ専用 kernel (`simple_*`)。
 
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicU64};
-use cuda_device::{DisjointSlice, kernel, thread};
+use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 
 /// Simple FP16 FT activation forward (CReLU): f16 FT 出力 + f32 bias → f32 acted。
 ///
 /// `--ft-fp16-out` 経路の融合 kernel。`sparse_ft_forward_fp16_out` の f16 出力
 /// `ft_*_out_h` を直接 read (bias は別 buffer)、bias 加算と CReLU clamp を 1 pass で
-/// 完了して f32 `ft_*_acted` を書く。FP32 path の `bias_add_per_row` + `crelu_fwd`
-/// 2 launch を 1 launch に置き換え、`ft_*_out` (b × ft_dim) の DRAM read を f16 化
-/// して帯域を半減する。
+/// 完了して f32 `combined` の per-perspective 列範囲 (`col_offset`) へ直接書く。FP32
+/// path の `bias_add_per_row` + `crelu_fwd` 2 launch を 1 launch に置き換え、`ft_*_out`
+/// (b × ft_dim) の DRAM read を f16 化して帯域を半減する。
 ///
-/// 1 thread = 1 (batch, row) cell、atomic 不要。`ft_acted` 出力は f32 のまま
-/// (後続 `slice_scatter_2d` / cuBLAS Sgemm が f32 を要求)。bias は perspective 共有
+/// 1 thread = 1 (batch, row) cell、atomic 不要。出力 `combined` は f32 のまま
+/// (cuBLAS Sgemm が f32 を要求、中間 `ft_acted` + `slice_scatter_2d` 段は融合で除去)。bias は perspective 共有
 /// で行内で同じ `ri` を warp 内で共有するため L1 hit pattern が良好。
 #[kernel]
 pub fn simple_bias_act_fwd_fp16_in_crelu(
     ft_out: &[f16],
     bias: &[f32],
-    mut ft_acted: DisjointSlice<f32>,
+    mut combined: DisjointSlice<f32>,
+    combined_stride: u32,
+    col_offset: u32,
     batch: u32,
     ft_dim: u32,
 ) {
@@ -28,6 +30,7 @@ pub fn simple_bias_act_fwd_fp16_in_crelu(
         return;
     }
     let ri = tid.get() % (ft_dim as usize);
+    let bi = tid.get() / (ft_dim as usize);
     let x = ft_out[tid.get()] as f32 + bias[ri];
     #[allow(clippy::manual_clamp)]
     let y = if x < 0.0_f32 {
@@ -37,8 +40,13 @@ pub fn simple_bias_act_fwd_fp16_in_crelu(
     } else {
         x
     };
-    if let Some(o) = ft_acted.get_mut(tid) {
-        *o = y;
+    // combined (batch × combined_stride) の per-perspective 列範囲へ直接 scatter
+    // (中間 ft_acted + slice_scatter_2d の DRAM round-trip を融合で省く)。
+    let idx = bi * (combined_stride as usize) + (col_offset as usize) + ri;
+    // SAFETY: 各 thread が unique (bi, ri) → unique idx に書く。host が
+    // `2*ft_out <= combined_dim` を call site の debug_assert で保証。
+    unsafe {
+        *combined.get_unchecked_mut(idx) = y;
     }
 }
 
@@ -61,7 +69,9 @@ pub fn simple_bias_act_fwd_fp16_in_crelu(
 pub fn simple_act_grad_to_fp16_crelu_with_scale(
     ft_out: &[f16],
     bias: &[f32],
-    dft_acted: &[f32],
+    dcombined: &[f32],
+    combined_stride: u32,
+    col_offset: u32,
     mut dft_out: DisjointSlice<f16>,
     clamp_counter: &[u64], // len=1、clamp 発火数の cumulative atomic counter
     batch: u32,
@@ -74,9 +84,13 @@ pub fn simple_act_grad_to_fp16_crelu_with_scale(
         return;
     }
     let ri = tid.get() % (ft_dim as usize);
+    let bi = tid.get() / (ft_dim as usize);
+    // dcombined (batch × combined_stride) の per-perspective 列範囲を直接読む
+    // (slice_extract_2d で中間 buffer に取り出す DRAM round-trip を融合で省く)。
+    let dft = dcombined[bi * (combined_stride as usize) + (col_offset as usize) + ri];
     let x = ft_out[tid.get()] as f32 + bias[ri];
     let g = if x > 0.0_f32 && x < 1.0_f32 {
-        dft_acted[tid.get()]
+        dft
     } else {
         0.0_f32
     };
@@ -110,7 +124,9 @@ pub fn simple_act_grad_to_fp16_crelu_with_scale(
 pub fn simple_bias_act_fwd_fp16_in_screlu(
     ft_out: &[f16],
     bias: &[f32],
-    mut ft_acted: DisjointSlice<f32>,
+    mut combined: DisjointSlice<f32>,
+    combined_stride: u32,
+    col_offset: u32,
     batch: u32,
     ft_dim: u32,
 ) {
@@ -120,6 +136,7 @@ pub fn simple_bias_act_fwd_fp16_in_screlu(
         return;
     }
     let ri = tid.get() % (ft_dim as usize);
+    let bi = tid.get() / (ft_dim as usize);
     let x = ft_out[tid.get()] as f32 + bias[ri];
     let a = if x < 0.0_f32 {
         0.0_f32
@@ -128,8 +145,13 @@ pub fn simple_bias_act_fwd_fp16_in_screlu(
     } else {
         x
     };
-    if let Some(o) = ft_acted.get_mut(tid) {
-        *o = a * a;
+    // combined (batch × combined_stride) の per-perspective 列範囲へ直接 scatter
+    // (中間 ft_acted + slice_scatter_2d の DRAM round-trip を融合で省く)。
+    let idx = bi * (combined_stride as usize) + (col_offset as usize) + ri;
+    // SAFETY: 各 thread が unique (bi, ri) → unique idx に書く。host が
+    // `2*ft_out <= combined_dim` を call site の debug_assert で保証。
+    unsafe {
+        *combined.get_unchecked_mut(idx) = a * a;
     }
 }
 
@@ -144,7 +166,9 @@ pub fn simple_bias_act_fwd_fp16_in_screlu(
 pub fn simple_act_grad_to_fp16_screlu_with_scale(
     ft_out: &[f16],
     bias: &[f32],
-    dft_acted: &[f32],
+    dcombined: &[f32],
+    combined_stride: u32,
+    col_offset: u32,
     mut dft_out: DisjointSlice<f16>,
     clamp_counter: &[u64], // len=1、clamp 発火数の cumulative atomic counter
     batch: u32,
@@ -157,6 +181,10 @@ pub fn simple_act_grad_to_fp16_screlu_with_scale(
         return;
     }
     let ri = tid.get() % (ft_dim as usize);
+    let bi = tid.get() / (ft_dim as usize);
+    // dcombined (batch × combined_stride) の per-perspective 列範囲を直接読む
+    // (slice_extract_2d で中間 buffer に取り出す DRAM round-trip を融合で省く)。
+    let dft = dcombined[bi * (combined_stride as usize) + (col_offset as usize) + ri];
     let x = ft_out[tid.get()] as f32 + bias[ri];
     let a = if x < 0.0_f32 {
         0.0_f32
@@ -170,7 +198,7 @@ pub fn simple_act_grad_to_fp16_screlu_with_scale(
     } else {
         0.0_f32
     };
-    let g = dft_acted[tid.get()] * dydx;
+    let g = dft * dydx;
     let s = g * dft_scale;
     let mut local_clamps: u64 = 0;
     let s_c = if s > 65504.0_f32 {
@@ -271,14 +299,24 @@ pub fn simple_sparse_ft_backward_fp16(
 }
 
 /// Simple FT bias grad の dual variant: stm / nstm 両 perspective の dft (post-activation
-/// gradient) を 1 launch で読み込み、`grad_bias[oi]` への atomic add を per-thread に 1 回
-/// にまとめる kernel。1 thread = 1 (batch, ft_oi) cell、stm + nstm のローカル和を作って
-/// から atomic add するため、ft_b_grad への atomic contention 数は B * ft_dim 回 (per-cell
-/// 単発の bias_grad を 2 perspective 別 launch で 2 回打つ場合の半分)。
+/// gradient) を 1 launch で読み、`grad_bias[oi] += Σ_b (dft_stm[b][oi] + dft_nstm[b][oi])`
+/// を計算する。
 ///
-/// atomic add の演算は可換・結合的で、launch 順を入れ替えても per-FP32 cell の最終値は
-/// 同等 (FP32 加算の非結合性で bit pattern は同一とは限らないが、CPU 参照との許容差
-/// 範囲には収まる)。`grad_bias` は呼出前に host が 0 にリセット済 (`ws.ft_b_grad`)。
+/// **2D-grid per-output tile reduction**: thread が出力 `oi = blockIdx_y * blockDim_x +
+/// threadIdx_x` を専有する。grid.x = position tile (各 block が `items` positions を担当)、
+/// grid.y = output tile。`block_dim = min(ft_dim, 1024)`・`grid.y = ceil(ft_dim / block_dim)`
+/// なので CUDA の block 上限 1024 を超える ft_dim でも output を y タイルに割って起動できる
+/// (`ft_dim <= 1024` では block_dim = ft_dim・grid.y = 1 で 1D 起動と等価)。末尾 output tile の
+/// padding (`oi >= ft_dim`) は早期 return で捨てる。thread `oi` は自 block 担当の `items`
+/// positions を register に直列累積してから `grad_bias[oi]` へ global atomic を 1 回打つ。
+/// global atomic contention は `ceil(B/items) * ft_dim` で、1 thread 1 cell が直接 atomic add
+/// する素朴版 (`B * ft_dim`) より少ない。固定 position で block 内 thread は連続 cell
+/// (`p * ft_dim + oi`) を読むため coalesced を保つ。
+///
+/// atomic add は可換だが FP32 加算は非結合のため、block 内 register 和の順序で rounding が
+/// 変わる (1 thread 1 cell の atomic 版と bit pattern は同一とは限らないが CPU 参照との許容差内)。
+/// `grad_bias` は呼出前に host が 0 reset 済 (`ws.ft_b_grad`)。caller は `block_dim ==
+/// min(ft_dim, 1024)`・`grid.x == ceil(batch/items)`・`grid.y == ceil(ft_dim/block_dim)` を保証する。
 #[kernel]
 pub fn simple_bias_grad_dual(
     dft_stm: &[f32],
@@ -286,29 +324,36 @@ pub fn simple_bias_grad_dual(
     grad_bias: &[f32],
     batch: u32,
     ft_dim: u32,
+    items: u32,
 ) {
-    let tid = thread::index_1d();
-    let total = (batch as usize) * (ft_dim as usize);
-    if tid.get() >= total {
+    let oi = thread::blockIdx_y() as usize * thread::blockDim_x() as usize
+        + thread::threadIdx_x() as usize;
+    let ft = ft_dim as usize;
+    if oi >= ft {
         return;
     }
-    let oi = tid.get() % (ft_dim as usize);
-    let stm_val = dft_stm[tid.get()];
-    let nstm_val = dft_nstm[tid.get()];
-    let sum = stm_val + nstm_val;
-    // SAFETY: `grad_bias.len() == ft_dim` を host が保証 (workspace の `ft_b_grad` は
-    // ft_dim で固定)、`oi < ft_dim` は `tid % ft_dim` で保証。`f32` (align 4) と
-    // `DeviceAtomicF32` (`#[repr(transparent)]` over UnsafeCell<f32>) は同 alignment。
-    // 本 kernel 起動中に `grad_bias` を non-atomic 経路で書く path は無く (forward は
-    // bias を READ のみ、本関数より先に走る同 step backward 段も `ft_b_grad` を書かない)、
-    // atomic add 同士の競合は GPU が serialize する。
+    let batch_u = batch as usize;
+    let pos_start = thread::blockIdx_x() as usize * items as usize;
+    let pos_end = (pos_start + items as usize).min(batch_u);
+    let mut acc = 0.0_f32;
+    let mut p = pos_start;
+    while p < pos_end {
+        let idx = p * ft + oi;
+        acc += dft_stm[idx] + dft_nstm[idx];
+        p += 1;
+    }
+    // SAFETY: `grad_bias.len() == ft_dim` を host が保証、`oi < ft_dim` は冒頭の early return
+    // で保証。`f32` (align 4) と `DeviceAtomicF32` は同 alignment。本 kernel 起動中に
+    // `grad_bias` を non-atomic で書く path は無く、atomic add 同士は GPU が serialize する。
     let cell = unsafe { &*(grad_bias.as_ptr().add(oi) as *const DeviceAtomicF32) };
-    cell.fetch_add(sum, AtomicOrdering::Relaxed);
+    cell.fetch_add(acc, AtomicOrdering::Relaxed);
 }
 
 /// Simple FT bias grad dual の FP16 入力版 (`--ft-fp16-out` 経路)。stm / nstm 両 dft
-/// (`f16`、loss scaling 済) を読み、`dft_inv_scale` で打ち消した値を per-thread に 1 atomic
-/// で `ft_b_grad[oi]` に accumulate。FP32 版と同じ atomic 半減効果がある。
+/// (`f16`、loss scaling 済) を読み `dft_inv_scale` で打ち消した値を accumulate する。
+/// reduction 構造は [`simple_bias_grad_dual`] と同一 (2D-grid per-output tile、`oi =
+/// blockIdx_y * blockDim_x + threadIdx_x`、thread `oi` が `items` positions を register 累積
+/// → global atomic 1 回)。
 #[kernel]
 pub fn simple_bias_grad_dual_fp16(
     dft_stm: &[f16],
@@ -317,21 +362,107 @@ pub fn simple_bias_grad_dual_fp16(
     batch: u32,
     ft_dim: u32,
     dft_inv_scale: f32,
+    items: u32,
 ) {
-    let tid = thread::index_1d();
-    let total = (batch as usize) * (ft_dim as usize);
-    if tid.get() >= total {
+    let oi = thread::blockIdx_y() as usize * thread::blockDim_x() as usize
+        + thread::threadIdx_x() as usize;
+    let ft = ft_dim as usize;
+    if oi >= ft {
         return;
     }
-    let oi = tid.get() % (ft_dim as usize);
-    let stm_val = dft_stm[tid.get()] as f32 * dft_inv_scale;
-    let nstm_val = dft_nstm[tid.get()] as f32 * dft_inv_scale;
-    let sum = stm_val + nstm_val;
-    // SAFETY: FP32 版 `simple_bias_grad_dual` と同一の不変条件
-    // (grad_bias.len() == ft_dim、oi < ft_dim、`DeviceAtomicF32` alignment 共有、
-    // non-atomic 競合 path 無し、atomic add 同士のみ GPU serialize)。
+    let batch_u = batch as usize;
+    let pos_start = thread::blockIdx_x() as usize * items as usize;
+    let pos_end = (pos_start + items as usize).min(batch_u);
+    let mut acc = 0.0_f32;
+    let mut p = pos_start;
+    while p < pos_end {
+        let idx = p * ft + oi;
+        acc += dft_stm[idx] as f32 * dft_inv_scale + dft_nstm[idx] as f32 * dft_inv_scale;
+        p += 1;
+    }
+    // SAFETY: FP32 版 `simple_bias_grad_dual` と同一の不変条件 (grad_bias.len() == ft_dim、
+    // oi < ft_dim は冒頭の early return で保証、`DeviceAtomicF32` alignment 共有、
+    // atomic add 同士のみ serialize)。
     let cell = unsafe { &*(grad_bias.as_ptr().add(oi) as *const DeviceAtomicF32) };
-    cell.fetch_add(sum, AtomicOrdering::Relaxed);
+    cell.fetch_add(acc, AtomicOrdering::Relaxed);
+}
+
+/// Dense 層 (小 out_dim) の bias 勾配 `grad_bias[oi] += Σ_b dy[b][oi]` を grid-stride の
+/// per-column register 累積 + shared-mem tree reduction で求める。
+///
+/// 素朴版 ([`super::layerstack::bias_grad`]) は 1 thread = 1 `(b, oi)` cell が `grad_bias[oi]`
+/// へ直接 atomic add し、`out_dim` cell に batch 本の atomicAdd が集中する (batch-way
+/// contention)。out_dim が小さい dense 層では SM がほぼ atomic 直列化待ちになる。
+///
+/// 集約構造: thread `oi = tid % out_dim` が出力 `oi` を専有し、`r = tid / out_dim`
+/// (block あたり `R = block_dim / out_dim` thread/列) が grid-stride で担当 row を register
+/// 累積する。block 内で R 個の部分和を shared-mem tree reduction (r 軸を半分ずつ畳む) で 1 本に
+/// し、`grad_bias[oi]` への global atomic を block あたり 1 回に減らす。contention は
+/// `batch * out_dim` → `gridDim * out_dim`。各 iteration で block の R 行 × out_dim 列が連続
+/// `block_dim` cell (`dy[block_base + tid]`) を読むため coalesced を保つ。
+///
+/// register 累積 → tree reduction → block 跨ぎ atomic で同じ項を別順序に足すため FP32
+/// 加算の非結合性で最下位 bit が変わり得る (素朴版の global atomic も順序非決定)。和の値は
+/// 同一で、全部分和が 2^24 未満に収まる整数値入力では各 f32 加算が exact かつ順序非依存に
+/// なり CPU 参照と bit 一致する (単体テストがこの条件下で exact 検証)。`grad_bias` は
+/// 呼出前に host が 0 reset 済。
+///
+/// caller invariant: `block_dim % out_dim == 0`、`R = block_dim / out_dim` は 2 冪 (tree
+/// reduction が R を完全に畳める前提)、`block_dim <= 256` (`PARTIAL` 固定容量、ゆえに
+/// `out_dim <= 256`)。
+#[kernel]
+pub fn dense_bias_grad_tiled(dy: &[f32], grad_bias: &[f32], batch: u32, out_dim: u32) {
+    use core::ptr::addr_of_mut;
+    // block_dim <= 256 を host が保証。1 KB、occupancy への影響は無視できる。
+    static mut PARTIAL: SharedArray<f32, 256> = SharedArray::UNINIT;
+    let tid = thread::threadIdx_x() as usize;
+    let block_dim = thread::blockDim_x() as usize;
+    let out = out_dim as usize;
+    let oi = tid % out;
+    let r = tid / out;
+    // R = block_dim / out_dim: 1 列あたりの thread 数。host が block_dim % out_dim == 0 を保証。
+    let rows_per_iter = block_dim / out;
+    let batch_u = batch as usize;
+
+    // grid-stride: block bx の thread (r, oi) は row {bx*R + r, + gridDim*R, ...} を担当。
+    let grid = thread::gridDim_x() as usize;
+    let stride = grid * rows_per_iter;
+    let mut row = thread::blockIdx_x() as usize * rows_per_iter + r;
+    let mut acc = 0.0_f32;
+    while row < batch_u {
+        acc += dy[row * out + oi];
+        row += stride;
+    }
+
+    let partial_ptr: *mut f32 = addr_of_mut!(PARTIAL) as *mut f32;
+    unsafe {
+        partial_ptr.add(tid).write(acc);
+    }
+    thread::sync_threads();
+
+    // r 軸の tree reduction: stride を半分ずつ畳む。partner は同 oi の `r + s` 行
+    // (`tid + s * out`)。R が 2 冪なので s=R/2..1 で R 本の部分和が r==0 に集まる。
+    let mut s = rows_per_iter / 2;
+    while s >= 1 {
+        if r < s {
+            let v = unsafe { partial_ptr.add(tid).read() + partial_ptr.add(tid + s * out).read() };
+            unsafe {
+                partial_ptr.add(tid).write(v);
+            }
+        }
+        thread::sync_threads();
+        s /= 2;
+    }
+
+    // r==0 の thread (tid < out_dim) が列 oi の block 総和を持つ。block あたり 1 atomic。
+    if r == 0 {
+        let v = unsafe { partial_ptr.add(tid).read() };
+        // SAFETY: `grad_bias.len() == out_dim` を host が保証、`oi < out_dim`。`f32` (align 4) と
+        // `DeviceAtomicF32` は同 alignment。本 kernel 起動中に `grad_bias` を non-atomic で書く
+        // path は無く、atomic add 同士は GPU が serialize する。
+        let cell = unsafe { &*(grad_bias.as_ptr().add(oi) as *const DeviceAtomicF32) };
+        cell.fetch_add(v, AtomicOrdering::Relaxed);
+    }
 }
 
 /// Simple fwd_ft_post の fused kernel (CReLU 版): `bias_add_per_row` + `crelu_fwd` +

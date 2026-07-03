@@ -44,6 +44,7 @@ pub const fn threat_dimensions_of(profile: ThreatProfile) -> usize {
         ThreatProfile::Full => 216_720,
         ThreatProfile::SameClass => 192_640,
         ThreatProfile::SameClassMajorPawn => 173_568,
+        ThreatProfile::StepAttacker => 33_408,
         ThreatProfile::CrossSide => 96_320,
     }
 }
@@ -167,6 +168,41 @@ fn lookup_pair_base(
         None
     } else {
         Some(base)
+    }
+}
+
+/// profile に残る pair ごとに `(attacker_side, attacker_class, attacked_side,
+/// attacked_class, base, width)` を呼ぶ。`base` は threat block 内の先頭 feature
+/// index、`width` はその pair が占める feature 数 (`ATTACKS_PER_COLOR[attacker_class]`)。
+/// 除外 pair は飛ばす。
+///
+/// 盤面依存の [`ThreatIndexer::for_each_active_threat_index`] と異なり index 空間の
+/// 静的構造だけを返すので、threat FT row を pair-class 単位で操作する外部処理 (重み
+/// ablation 診断 / pair 別ノルム分解) が index→pair の逆引きなしに使える。
+pub fn for_each_threat_pair_range<F>(profile: ThreatProfile, mut f: F)
+where
+    F: FnMut(usize, ThreatClass, usize, ThreatClass, usize, usize),
+{
+    let (table, _dims) = build_pair_base(profile);
+    for attacker_side in 0..2 {
+        for &ac in &ALL_CLASSES {
+            for attacked_side in 0..2 {
+                for &dc in &ALL_CLASSES {
+                    if let Some(base) =
+                        lookup_pair_base(&table, attacker_side, ac, attacked_side, dc)
+                    {
+                        f(
+                            attacker_side,
+                            ac,
+                            attacked_side,
+                            dc,
+                            base,
+                            ATTACKS_PER_COLOR[ac as usize],
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -511,6 +547,8 @@ static SHARED_SAME_CLASS: LazyLock<ThreatIndexer> =
     LazyLock::new(|| ThreatIndexer::new(ThreatProfile::SameClass));
 static SHARED_SAME_CLASS_MAJOR_PAWN: LazyLock<ThreatIndexer> =
     LazyLock::new(|| ThreatIndexer::new(ThreatProfile::SameClassMajorPawn));
+static SHARED_STEP_ATTACKER: LazyLock<ThreatIndexer> =
+    LazyLock::new(|| ThreatIndexer::new(ThreatProfile::StepAttacker));
 static SHARED_CROSS_SIDE: LazyLock<ThreatIndexer> =
     LazyLock::new(|| ThreatIndexer::new(ThreatProfile::CrossSide));
 
@@ -596,6 +634,7 @@ impl ThreatIndexer {
             ThreatProfile::Full => &SHARED_FULL,
             ThreatProfile::SameClass => &SHARED_SAME_CLASS,
             ThreatProfile::SameClassMajorPawn => &SHARED_SAME_CLASS_MAJOR_PAWN,
+            ThreatProfile::StepAttacker => &SHARED_STEP_ATTACKER,
             ThreatProfile::CrossSide => &SHARED_CROSS_SIDE,
         }
     }
@@ -865,6 +904,10 @@ mod tests {
             173_568
         );
         assert_eq!(
+            ThreatIndexer::new(ThreatProfile::StepAttacker).threat_dimensions(),
+            33_408
+        );
+        assert_eq!(
             ThreatIndexer::new(ThreatProfile::CrossSide).threat_dimensions(),
             96_320
         );
@@ -876,6 +919,7 @@ mod tests {
             ThreatProfile::Full,
             ThreatProfile::SameClass,
             ThreatProfile::SameClassMajorPawn,
+            ThreatProfile::StepAttacker,
             ThreatProfile::CrossSide,
         ] {
             assert_eq!(
@@ -1001,6 +1045,7 @@ mod tests {
             ThreatProfile::Full,
             ThreatProfile::SameClass,
             ThreatProfile::SameClassMajorPawn,
+            ThreatProfile::StepAttacker,
             ThreatProfile::CrossSide,
         ] {
             assert_indices_in_range(profile, &startpos_board());

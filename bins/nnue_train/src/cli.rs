@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+#[cfg(any(feature = "gpu", test))]
 use nnue_format::ArchKind;
 
 use crate::arch::*;
@@ -194,6 +195,24 @@ pub(crate) struct Cli {
     /// `--resume` are mutually exclusive).
     #[arg(long, global = true)]
     pub(crate) init_from: Option<PathBuf>,
+
+    /// Load weights (via --init-from / --resume), evaluate held-out test_loss /
+    /// test_accuracy once, and exit without training. Requires held-out data
+    /// (--test-tail-positions or --test-data).
+    #[arg(long, global = true)]
+    pub(crate) eval_only: bool,
+
+    /// Zero a subset of the loaded threat FT rows before eval/train, to measure
+    /// that subset's eval contribution (threat net + --init-from only). One of:
+    /// all | slider-attacker | step-attacker | bigslider-attacker | defense |
+    /// attack | same-class | random:<seed>:<dims>.
+    #[arg(long, global = true)]
+    pub(crate) threat_ablate: Option<String>,
+
+    /// Print a pair-class L2-norm breakdown of the loaded threat FT weights and
+    /// exit (no eval; threat net + --init-from only).
+    #[arg(long, global = true)]
+    pub(crate) threat_norm_dump: bool,
 
     /// Resume training by restoring weights + Ranger optimizer state
     /// (m/v/slow/step) from a raw checkpoint (`{net_id}-{sb}.ckpt`) — a true
@@ -467,6 +486,7 @@ pub(crate) enum LrScheduleArg {
 /// 「`--ft-fp16-out` が raw 指定されていて、`--all-optim` も無く、`--ft-fp16` も raw 指定
 /// されていない」ときのみ。これにより `--all-optim --ft-fp16-out` (冗長指定) を
 /// false-positive reject しない。
+#[cfg(any(feature = "gpu", test))]
 pub(crate) fn ft_fp16_out_missing_ft_fp16(
     ft_fp16_out_raw: bool,
     ft_fp16_raw: bool,
@@ -487,6 +507,7 @@ pub(crate) enum ArchCommand {
 
 impl ArchCommand {
     /// サブコマンドに対応する [`ArchKind`]。
+    #[cfg(any(feature = "gpu", test))]
     pub(crate) fn kind(&self) -> ArchKind {
         match self {
             ArchCommand::LayerStack(_) => ArchKind::LayerStack,
@@ -639,7 +660,7 @@ pub(crate) struct LayerstackArgs {
     pub(crate) no_ft_factorize: bool,
 
     /// Threat sparse feature profile. One of: off (default), full, same-class,
-    /// same-class-major-pawn, cross-side. When not `off`, threat edge features
+    /// same-class-major-pawn, step-attacker, cross-side. When not `off`, threat edge features
     /// (one piece attacking another) are concatenated after the base feature
     /// transformer inputs, growing the FT input dimension and the active-feature
     /// count. `off` is bit-identical to the base feature set.
@@ -674,6 +695,7 @@ impl LayerstackArgs {
     /// command-line 上で後勝ちする。`--psqt` / `--init-from` との排他は
     /// 呼び出し側 (`run_training`) が auto-suppress で解決するため、ここには
     /// 含めない (この値は「ユーザーが factorizer を望むか」だけを表す)。
+    #[cfg(any(feature = "gpu", test))]
     pub(crate) fn ft_factorize_enabled(&self) -> bool {
         !self.no_ft_factorize
     }

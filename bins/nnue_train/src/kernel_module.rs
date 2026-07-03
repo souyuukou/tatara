@@ -24,10 +24,7 @@ pub(crate) fn ensure_direct_path_kernels(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::arch::BUCKET_SORT_MAX_N;
 
-    const KERNELS: &[&str] = &[
-        "dense_mm_fwd_bucket",
-        "dense_mm_bwd_weight_bucket_unsorted",
-    ];
+    const KERNELS: &[&str] = &["dense_mm_fwd_bucket", "dense_mm_bwd_weight_bucket_unsorted"];
     for &name in KERNELS {
         module.load_function(name).map_err(|e| {
             format!(

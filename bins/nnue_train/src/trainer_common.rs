@@ -5,6 +5,20 @@ use shogi_features::FeatureSetSpec;
 
 use crate::kernel_module::*;
 
+/// GPU trainer の数値精度と optimizer state の形式を選択する。既定値はすべて無効。
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PrecisionFlags {
+    /// cuBLAS の dense 演算で TF32 Tensor Core math mode を使う。無効時は FP32。
+    /// 詳細は [`CublasHandle::new`] を参照。
+    pub(crate) tf32: bool,
+    /// FT forward weight を FP16 mirror または factorized comb から読み込む。
+    pub(crate) ft_fp16: bool,
+    /// FT activation とその gradient を FP16 で保持する。`ft_fp16` を必要とする。
+    pub(crate) ft_fp16_out: bool,
+    /// FT weight の optimizer moment を scale 付き FP16 で保持する。
+    pub(crate) fp16_opt_state: bool,
+}
+
 /// `ft_w` の Ranger moment (`m` / `v`) buffer。既定は `f32`、`--fp16-opt-state` で
 /// `f16` (格納時 scale 付き、[`radam_step_f16state`])。`ft_w` は 112.6M 要素で
 /// optimizer phase の DRAM traffic を占めるため `f16` 化の効果がある一方、他 9 group
@@ -213,11 +227,239 @@ impl BatchData<'_> {
     }
 }
 
+macro_rules! trainer_backend_impl {
+    (
+        trainer: $trainer:ty,
+        feature_set: $($feature_set:ident).+,
+        batch: $batch_kind:ident,
+        weights: $weights:ident,
+        step_error: $step_error:literal,
+        validate_error: $validate_error:literal,
+        flush_error: $flush_error:literal,
+        weights_error: $weights_error:literal,
+        resume_error: $resume_error:literal $(,)?
+    ) => {
+        impl nnue_train::trainer::TrainerBackend for $trainer {
+            fn train_step(
+                &mut self,
+                batch: &nnue_train::dataloader::Batch,
+                bucket_idx: &[i32],
+                lr: f32,
+                wdl_lambda: f32,
+                loss: nnue_train::trainer::LossKind,
+            ) -> std::io::Result<f64> {
+                // dataloader が出した batch の feature set が trainer 構築時に選んだ
+                // feature set と一致することを確認する。buffer サイズ / kernel launch
+                // 次元は trainer の feature set 前提で確保済のため、不一致は
+                // out-of-bounds になる。
+                if batch.feature_set != self.$($feature_set).+ {
+                    return Err(std::io::Error::other(format!(
+                        "batch feature set '{}' does not match trainer feature set '{}'",
+                        batch.feature_set.canonical_name(),
+                        self.$($feature_set).+.canonical_name(),
+                    )));
+                }
+                let data = $crate::trainer_common::trainer_backend_impl!(
+                    @batch $batch_kind,
+                    batch,
+                    bucket_idx
+                );
+                self.step(&data, lr, wdl_lambda, loss)
+                    .map_err(|e| std::io::Error::other(format!($step_error, e)))
+            }
+
+            fn validate_step(
+                &mut self,
+                batch: &nnue_train::dataloader::Batch,
+                bucket_idx: &[i32],
+                wdl_lambda: f32,
+                loss: nnue_train::trainer::LossKind,
+            ) -> std::io::Result<nnue_train::trainer::ValidationStepOutput> {
+                // dataloader が出した batch の feature set が trainer 構築時に選んだ
+                // feature set と一致することを確認する。buffer サイズ / kernel launch
+                // 次元は trainer の feature set 前提で確保済のため、不一致は
+                // out-of-bounds になる。
+                if batch.feature_set != self.$($feature_set).+ {
+                    return Err(std::io::Error::other(format!(
+                        "batch feature set '{}' does not match trainer feature set '{}'",
+                        batch.feature_set.canonical_name(),
+                        self.$($feature_set).+.canonical_name(),
+                    )));
+                }
+                let data = $crate::trainer_common::trainer_backend_impl!(
+                    @batch $batch_kind,
+                    batch,
+                    bucket_idx
+                );
+                let out = self
+                    .validate(&data, wdl_lambda, loss)
+                    .map_err(|e| std::io::Error::other(format!($validate_error, e)))?;
+                Ok(nnue_train::trainer::ValidationStepOutput {
+                    sum_sq_err: out.loss,
+                    net_output: out.net_output,
+                })
+            }
+
+            fn flush_pending_loss(&mut self) -> std::io::Result<f64> {
+                self.loss_ring
+                    .flush_pending_loss()
+                    .map_err(|e| std::io::Error::other(format!($flush_error, e)))
+            }
+
+            fn save_checkpoint(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+                let weights = self
+                    .$weights()
+                    .map_err(|e| std::io::Error::other(format!($weights_error, e)))?;
+                if let Some(parent) = path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
+                weights.save_quantised(&mut writer)?;
+                std::io::Write::flush(&mut writer)?;
+                Ok(())
+            }
+
+            fn save_resume_checkpoint(
+                &mut self,
+                path: &std::path::Path,
+                superbatch: usize,
+                run_id: &str,
+                lr_horizon: Option<usize>,
+            ) -> std::io::Result<()> {
+                self.save_raw_checkpoint(path, superbatch, run_id, lr_horizon)
+                    // `io::Error` は downcast して `ErrorKind` を保持したまま返す。
+                    .map_err(|e| match e.downcast::<std::io::Error>() {
+                        Ok(io_err) => *io_err,
+                        Err(other) => std::io::Error::other(format!($resume_error, other)),
+                    })
+            }
+
+            fn read_fp16_clamp_count(&mut self) -> std::io::Result<(u64, u64)> {
+                // `to_host_vec` 内部の `stream.synchronize` で十分。cumulative counter は
+                // superbatch 末の報告にだけ使うため、同期 path で問題ない。
+                let host = self
+                    .fp16_clamp_counter
+                    .to_host_vec(&self.stream)
+                    .map_err(|e| {
+                        std::io::Error::other(format!("clamp counter D2H failed: {e}"))
+                    })?;
+                Ok((host[0], self.fp16_clamp_elems_written))
+            }
+        }
+    };
+    (@batch bucketed, $batch:ident, $bucket_idx:ident) => {
+        $crate::trainer_common::BatchData::from_batch_ref($batch, $bucket_idx)
+    };
+    (@batch bucketless, $batch:ident, $bucket_idx:ident) => {{
+        // bucketless 経路では下流が `bucket_idx` に触れないため、受け取るだけでよい。
+        let _ = $bucket_idx;
+        $crate::trainer_common::BatchData::from_batch_ref_bucketless($batch)
+    }};
+}
+
+pub(crate) use trainer_backend_impl;
+
 /// `LaunchConfig` builder for 1D launch with `BLOCK_DIM` per block.
 pub(crate) fn cfg_1d(n: usize) -> LaunchConfig {
     LaunchConfig {
         grid_dim: grid_dim_1d(n, BLOCK_DIM),
         block_dim: (BLOCK_DIM, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// `dense_bias_grad_tiled` が扱える out_dim の上限。kernel の shared `PARTIAL` 容量
+/// (= block_dim 上限) と一致させる。`block_dim = R * out_dim <= 256` を保証するため、
+/// caller は out_dim がこれを超える層では generic `bias_grad` に fall back する。
+pub(crate) const DENSE_BIAS_GRAD_MAX_OUT: u32 = 256;
+
+/// Grid sizing 用の device occupancy パラメータ。`dense_bias_grad_tiled` の grid 上限を
+/// 実機の SM 数から導出するため、trainer 構築時に 1 度だけ問い合わせて保持する。特定
+/// GPU 固定の grid 上限を避けるためのもの。
+#[derive(Clone, Copy)]
+pub(crate) struct DeviceOccupancy {
+    /// SM 数 (`CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`)。
+    sm_count: u32,
+    /// SM あたり常駐 thread 上限 (`CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR`)。
+    max_threads_per_sm: u32,
+}
+
+impl DeviceOccupancy {
+    /// `ctx` の device から SM 数 / SM あたり thread 上限を問い合わせる。driver attribute
+    /// 照会で kernel launch には非依存 (`CudaContext::compute_capability` と同経路)。
+    pub(crate) fn query(ctx: &CudaContext) -> Result<Self, Box<dyn std::error::Error>> {
+        ctx.bind_to_thread()?;
+        let dev = ctx.cu_device();
+        let mut sm = std::mem::MaybeUninit::<i32>::uninit();
+        let mut threads = std::mem::MaybeUninit::<i32>::uninit();
+        // SAFETY: 出力先は MaybeUninit の有効ポインタ、属性 enum は driver の有効な ID、
+        // `dev` は `ctx` 由来の有効な CUdevice。`result()?` 成功時のみ assume_init する。
+        unsafe {
+            cuda_core::sys::cuDeviceGetAttribute(
+                sm.as_mut_ptr(),
+                cuda_core::sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                dev,
+            )
+            .result()?;
+            cuda_core::sys::cuDeviceGetAttribute(
+                threads.as_mut_ptr(),
+                cuda_core::sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR,
+                dev,
+            )
+            .result()?;
+            Ok(Self {
+                sm_count: sm.assume_init().max(1) as u32,
+                max_threads_per_sm: threads.assume_init().max(1) as u32,
+            })
+        }
+    }
+
+    /// `block_dim` thread の block で全 SM を thread 占有上限まで埋める block 数
+    /// `sm_count * floor(max_threads_per_sm / block_dim)`。grid をこれ以上に増やしても
+    /// occupancy は頭打ちで、`dense_bias_grad_tiled` では per-cell global atomic contention
+    /// (= gridDim) だけが増える。本 kernel の `block_dim` は常に ~128 以上 (`R * out_dim`、
+    /// `R` は 2 冪、`block_dim <= DENSE_BIAS_GRAD_MAX_OUT`) なので thread 占有が SM あたり
+    /// 常駐 block 数のハード上限より先に効き、その上限の別途クランプは要らない。
+    fn fill_blocks(self, block_dim: u32) -> u32 {
+        let per_sm = (self.max_threads_per_sm / block_dim.max(1)).max(1);
+        self.sm_count.saturating_mul(per_sm).max(1)
+    }
+
+    /// SM 数 / SM thread 上限を直接与えて構築する (CUDA device 非依存の単体テスト用)。
+    #[cfg(test)]
+    pub(crate) const fn from_counts(sm_count: u32, max_threads_per_sm: u32) -> Self {
+        Self {
+            sm_count,
+            max_threads_per_sm,
+        }
+    }
+}
+
+/// `dense_bias_grad_tiled` の launch config。`block_dim = R * out_dim` で `R` は
+/// `floor(DENSE_BIAS_GRAD_MAX_OUT / out_dim)` を超えない最大 2 冪 (kernel の tree
+/// reduction が `R` を完全に畳める前提、`block_dim <= DENSE_BIAS_GRAD_MAX_OUT` も満たす)。
+/// grid は batch を `R` 行/thread で覆う上限 `ceil(batch / R)` と、実機 SM を thread 占有
+/// 上限まで埋める `occ.fill_blocks(block_dim)` の小さい方。後者で grid を occupancy が
+/// 頭打ちになる点に抑え、余分な global atomic contention を避ける (SM 数を実機問い合わせ
+/// 値から導くので特定 GPU 非依存)。caller は `1 <= out_dim <= DENSE_BIAS_GRAD_MAX_OUT`
+/// を保証する。
+pub(crate) fn cfg_dense_bias_grad(occ: DeviceOccupancy, batch: u32, out_dim: u32) -> LaunchConfig {
+    debug_assert!(
+        (1..=DENSE_BIAS_GRAD_MAX_OUT).contains(&out_dim),
+        "cfg_dense_bias_grad requires 1 <= out_dim <= {DENSE_BIAS_GRAD_MAX_OUT}, got {out_dim}"
+    );
+    let cap = (DENSE_BIAS_GRAD_MAX_OUT / out_dim).max(1);
+    let mut r = 1_u32;
+    while r * 2 <= cap {
+        r *= 2;
+    }
+    let block = r * out_dim;
+    let grid = batch.div_ceil(r).clamp(1, occ.fill_blocks(block));
+    LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (block, 1, 1),
         shared_mem_bytes: 0,
     }
 }

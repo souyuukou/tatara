@@ -1,18 +1,92 @@
-use std::io::Write;
 use std::path::Path;
 
-use cuda_host::cuda_launch;
-use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
+use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, cuda_launch};
 use nnue_format::ArchKind;
 use nnue_format::LayerStackWeights;
-use nnue_train::dataloader::Batch;
 use nnue_train::init::{self, LayerStackInit, WeightShape};
 use nnue_train::optimizer::radam_compute_step_size_denom;
-use nnue_train::trainer::{LossKind, TrainerBackend, ValidationStepOutput};
+use nnue_train::trainer::LossKind;
 use shogi_features::FeatureSetSpec;
 
 use crate::*;
 use crate::{arch::*, ckpt::*, kernel_module::*, trainer_common::*};
+
+struct StepContext<'a> {
+    lr: f32,
+    wdl_lambda: f32,
+    loss: LossKind,
+    validate: bool,
+    profile_step: bool,
+    prof_t0: &'a mut std::time::Instant,
+    b: usize,
+    b_u32: u32,
+    ft_out: usize,
+    l1_out: usize,
+    l1_effective: usize,
+    l2_in: usize,
+    l2_out: usize,
+    n_out_tiles: usize,
+    padded_b: usize,
+}
+
+pub(crate) struct StepOptions<'a> {
+    lr: f32,
+    wdl_lambda: f32,
+    loss: LossKind,
+    validate: bool,
+    profile_step: bool,
+    prof_t0: &'a mut std::time::Instant,
+}
+
+impl<'a> StepContext<'a> {
+    fn new(
+        trainer: &GpuTrainer,
+        batch: &BatchData,
+        options: StepOptions<'a>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let b = batch.n_pos;
+        if !b.is_multiple_of(16) {
+            return Err(format!(
+                "batch.n_pos must be a multiple of 16 (got {}); tiled dense matmul kernels \
+                 require b % 16 == 0 — partial last batch will silently truncate via grid=b/16",
+                b
+            )
+            .into());
+        }
+        // batch `b` が workspace 容量に収まることを検証する (固定 batch 前提、
+        // 起動時の `GpuWorkspace::new` で確保済)。
+        trainer.ws.check_batch_capacity(b)?;
+        // FT 出力次元 (`--ft-out`)。post-FT buffer の幅と FT kernel の launch arg。
+        let ft_out = trainer.ws.ft_out;
+        // L1 (per-bucket dense) 層の次元 (`--l1` 由来) と派生次元。
+        let l1_out = trainer.ws.l1_out;
+        let l1_effective = trainer.ws.l1_effective();
+        let l2_in = trainer.ws.l2_in();
+        // L2 (per-bucket dense) 層の出力次元 (`--l2` 由来)。L2 / L3 kernel の launch arg。
+        let l2_out = trainer.ws.l2_out;
+        Ok(Self {
+            lr: options.lr,
+            wdl_lambda: options.wdl_lambda,
+            loss: options.loss,
+            validate: options.validate,
+            profile_step: options.profile_step,
+            prof_t0: options.prof_t0,
+            b,
+            b_u32: b as u32,
+            ft_out,
+            l1_out,
+            l1_effective,
+            l2_in,
+            l2_out,
+            // L1 系 tiled/sorted dense matmul kernel は出力次元を `TILE_OUT = 16` 幅の
+            // out-tile に分割して処理する。`n_out_tiles` は out-tile 数で、kernel の grid
+            // 次元 (forward / weight backward) や内部 loop 回数を決める。`l1_out <= 16` の
+            // とき `n_out_tiles == 1` で out-tile 軸は長さ 1 に縮退する。
+            n_out_tiles: l1_out.div_ceil(16),
+            padded_b: padded_sort_batch(b, trainer.num_buckets),
+        })
+    }
+}
 
 // ===========================================================================
 // GpuTrainer (LayerStack: FT ft_out → L1 l1_out → L2 l2_out + progress8kpabs 9 buckets)
@@ -313,7 +387,9 @@ pub(crate) struct GpuWorkspace {
 
     // -- inverse-index sparse_ft_backward scratch (sized by feature set) --
     feat_counts: DeviceBuffer<u32>, // ft_in: per-feature histogram (atomic build)
-    feat_offsets: DeviceBuffer<u32>, // ft_in + 1: exclusive prefix sum
+    feat_offsets: DeviceBuffer<u32>, // ft_in + 1: exclusive prefix sum (multi-block scan)
+    feat_block_sums: DeviceBuffer<u32>, // ceil(ft_in/1024): scan level 1 per-block total
+    feat_block_offsets: DeviceBuffer<u32>, // ceil(ft_in/1024)+1: scan level 2 (block totals)
     feat_write_ctr: DeviceBuffer<u32>, // ft_in: scatter atomic counter
     feat_positions: DeviceBuffer<u32>, // up to batch * max_active: sorted positions
 
@@ -460,6 +536,8 @@ impl GpuWorkspace {
             dft_nstm_out: z(ft_act_f32_n)?,
             feat_counts: DeviceBuffer::<u32>::zeroed(stream, ft_in)?,
             feat_offsets: DeviceBuffer::<u32>::zeroed(stream, ft_in + 1)?,
+            feat_block_sums: DeviceBuffer::<u32>::zeroed(stream, ft_in.div_ceil(1024))?,
+            feat_block_offsets: DeviceBuffer::<u32>::zeroed(stream, ft_in.div_ceil(1024) + 1)?,
             feat_write_ctr: DeviceBuffer::<u32>::zeroed(stream, ft_in)?,
             feat_positions: DeviceBuffer::<u32>::zeroed(stream, batch * max_active)?,
             stm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
@@ -474,7 +552,12 @@ impl GpuWorkspace {
             wdl_dev_back: DeviceBuffer::<f32>::zeroed(stream, batch)?,
             bucket_sort: match bucket_layout {
                 BucketLayout::Sorted => Some(BucketSortScratch::new(
-                    stream, batch, ft_out, l1_out, l2_out, num_buckets,
+                    stream,
+                    batch,
+                    ft_out,
+                    l1_out,
+                    l2_out,
+                    num_buckets,
                 )?),
                 BucketLayout::Direct => None,
             },
@@ -644,14 +727,7 @@ impl GpuTrainer {
     /// CUDA context を作成し、kernel module を load、10 weight groups + Ranger state +
     /// 中間 activation workspace (`batch_size` 分) を確保。
     ///
-    /// `enable_tf32` は cuBLAS の `cublasSetMathMode` 引数を切替 ([`CublasHandle::new`])、
-    /// `true` で Ampere+ TC TF32 mode、`false` で純 FP32。default は CLI 側で OFF。
-    ///
-    /// `ft_fp16` が true なら forward 用 f16 weight (`ft_w_h` — factorizer 無効時は
-    /// master の cast mirror、有効時は base 形状の畳み込み済み comb、field doc 参照)
-    /// を確保し、forward を FP16 版に切替える。false なら未確保で従来 path。
-    /// `ft_fp16_out` が true なら FT activation も FP16 で持つ (`ft_fp16` を要求、
-    /// caller が validation 済)。
+    /// 数値精度と optimizer state の形式は [`PrecisionFlags`] で指定する。
     ///
     /// forward 用 FT weight (mirror / comb) は構築時に初期重みと同期されるため、
     /// 返った trainer はそのまま `step` / `validate` できる。`--init-from` /
@@ -671,10 +747,7 @@ impl GpuTrainer {
         l1_out: usize,
         l2_out: usize,
         num_buckets: usize,
-        enable_tf32: bool,
-        ft_fp16: bool,
-        ft_fp16_out: bool,
-        fp16_opt_state: bool,
+        precision: PrecisionFlags,
         feature_set: FeatureSetSpec,
         optim_groups: OptimGroupConfig,
         norm_loss_factor: Option<f32>,
@@ -685,10 +758,12 @@ impl GpuTrainer {
             (2..=MAX_SUPPORTED_NUM_BUCKETS).contains(&num_buckets),
             "GpuTrainer requires num_buckets in [2, {MAX_SUPPORTED_NUM_BUCKETS}]"
         );
-        // `ft_fp16_out` は weight FP16 path の拡張なので `ft_fp16` を含意する。CLI 検証
-        // (`run_training`) で reject 済だが、forward 分岐の各 `.expect()` がこの不変条件を
-        // 前提にするため constructor でも明示する。
-        debug_assert!(!ft_fp16_out || ft_fp16, "ft_fp16_out requires ft_fp16");
+        // `precision.ft_fp16_out` は `precision.ft_fp16` を必要とする。CLI validation は
+        // 無効な組み合わせを拒否するが、smoke/test は constructor を直接呼べるため、ここでも検査する。
+        debug_assert!(
+            !precision.ft_fp16_out || precision.ft_fp16,
+            "ft_fp16_out requires ft_fp16"
+        );
         let stream = ctx.default_stream();
         let bucket_layout = BucketLayout::from_num_buckets(num_buckets);
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
@@ -809,14 +884,14 @@ impl GpuTrainer {
             module,
             // FT
             ft_w: DeviceBuffer::from_host(&stream, &ft_w_init)?,
-            ft_w_m: MomentBuf::zeroed(&stream, ft_w_n, fp16_opt_state)?,
-            ft_w_v: MomentBuf::zeroed(&stream, ft_w_n, fp16_opt_state)?,
+            ft_w_m: MomentBuf::zeroed(&stream, ft_w_n, precision.fp16_opt_state)?,
+            ft_w_v: MomentBuf::zeroed(&stream, ft_w_n, precision.fp16_opt_state)?,
             ft_w_slow: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
             ft_w_grad: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
             // factorizer 有効時の `ft_w_h` / `ft_w_fold32` は forward 用 comb
             // (base 形状)、無効時の `ft_w_h` は master の cast mirror (train 形状
             // = base と同値)。いずれも `sync_ft_forward_weights` が初期同期する。
-            ft_w_h: if ft_fp16 {
+            ft_w_h: if precision.ft_fp16 {
                 let n = if feature_set.ft_factorize() {
                     base_ft_in * ft_out
                 } else {
@@ -826,7 +901,7 @@ impl GpuTrainer {
             } else {
                 None
             },
-            ft_w_fold32: if feature_set.ft_factorize() && !ft_fp16 {
+            ft_w_fold32: if feature_set.ft_factorize() && !precision.ft_fp16 {
                 Some(DeviceBuffer::<f32>::zeroed(&stream, base_ft_in * ft_out)?)
             } else {
                 None
@@ -892,7 +967,7 @@ impl GpuTrainer {
                 l2_out,
                 num_buckets,
                 BucketLayout::from_num_buckets(num_buckets),
-                ft_fp16_out,
+                precision.ft_fp16_out,
                 feature_set,
             )?,
             // loss + step
@@ -902,10 +977,10 @@ impl GpuTrainer {
             fp16_clamp_elems_written: 0,
             loss_ring: AsyncLossRing::new(ctx)?,
             input_ring: InputUploadRing::new(ctx, batch_size.max(1), feature_set.max_active())?,
-            cublas: CublasHandle::new(&stream, enable_tf32)?,
-            ft_fp16,
-            ft_fp16_out,
-            fp16_opt_state,
+            cublas: CublasHandle::new(&stream, precision.tf32)?,
+            ft_fp16: precision.ft_fp16,
+            ft_fp16_out: precision.ft_fp16_out,
+            fp16_opt_state: precision.fp16_opt_state,
             feature_set,
             optim_groups,
             norm_loss_factor,
@@ -1270,8 +1345,7 @@ impl GpuTrainer {
     ///
     /// magic 不一致、`version > 5`、arch kind / topology が LayerStack と不一致、group 数
     /// や各 group の len が LayerStack arch と不一致、または `u64 → usize` overflow
-    /// (32-bit / 破損 file) は `InvalidData` で reject
-    /// (`crates/nnue-train::optimizer::RangerHostState::load_from_reader` と同方針)。
+    /// (32-bit / 破損 file) は `InvalidData` で reject。
     ///
     /// header / group 本体の読み出しと照合は [`load_raw_checkpoint_file`] が担当する
     /// (version 互換規則は [`read_raw_ckpt_header`] を参照)。本 method は読み込んだ
@@ -1517,12 +1591,14 @@ impl GpuTrainer {
         let mut prof_t0 = std::time::Instant::now();
         let result = self.step_impl(
             batch,
-            lr,
-            wdl_lambda,
-            loss,
-            false,
-            profile_step,
-            &mut prof_t0,
+            StepOptions {
+                lr,
+                wdl_lambda,
+                loss,
+                validate: false,
+                profile_step,
+                prof_t0: &mut prof_t0,
+            },
         )?;
         // step_impl の per-step device buffer はここまでに全部 drop 済 (cuMemFree)。
         if profile_step {
@@ -1561,12 +1637,14 @@ impl GpuTrainer {
         // lr は validate モードでは optimizer を呼ばないため未使用 (0.0 を渡す)。
         self.step_impl(
             batch,
-            0.0,
-            wdl_lambda,
-            loss,
-            true,
-            profile_step,
-            &mut prof_t0,
+            StepOptions {
+                lr: 0.0,
+                wdl_lambda,
+                loss,
+                validate: true,
+                profile_step,
+                prof_t0: &mut prof_t0,
+            },
         )
     }
 
@@ -1594,16 +1672,10 @@ impl GpuTrainer {
     /// (backward / optimizer step は走らず weight は不変、held-out validation 用)。
     /// `validate == false` の通常 training path はこの分岐に入らないため、訓練の
     /// 数値挙動は本フラグ追加前と完全に同一。
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn step_impl(
         &mut self,
         batch: &BatchData,
-        lr: f32,
-        wdl_lambda: f32,
-        loss: LossKind,
-        validate: bool,
-        profile_step: bool,
-        prof_t0: &mut std::time::Instant,
+        options: StepOptions<'_>,
     ) -> Result<StepOutput, Box<dyn std::error::Error>> {
         let b = batch.n_pos;
         if b == 0 {
@@ -1618,32 +1690,36 @@ impl GpuTrainer {
         // 契約) ため通常到達しない。
         // release で debug_assert! が消えるので、ここで `step_impl` 直入りされた場合の保険として
         // 明示的な runtime check を入れる。
-        if !b.is_multiple_of(16) {
-            return Err(format!(
-                "batch.n_pos must be a multiple of 16 (got {}); tiled dense matmul kernels \
-                 require b % 16 == 0 — partial last batch will silently truncate via grid=b/16",
-                b
-            )
-            .into());
+        let mut context = StepContext::new(self, batch, options)?;
+        if let Some(output) = self.forward(batch, &mut context)? {
+            return Ok(output);
         }
-        let b_u32 = b as u32;
-        // FT 出力次元 (`--ft-out`)。post-FT buffer の幅と FT kernel の launch arg。
-        let ft_out = self.ws.ft_out;
-        // L1 (per-bucket dense) 層の次元 (`--l1` 由来) と派生次元。
-        let l1_out = self.ws.l1_out;
-        let l1_effective = self.ws.l1_effective();
-        let l2_in = self.ws.l2_in();
-        // L2 (per-bucket dense) 層の出力次元 (`--l2` 由来)。L2 / L3 kernel の launch arg。
-        let l2_out = self.ws.l2_out;
-        // L1 系 tiled/sorted dense matmul kernel は出力次元を `TILE_OUT = 16` 幅の
-        // out-tile に分割して処理する。`n_out_tiles` は out-tile 数で、kernel の grid
-        // 次元 (forward / weight backward) や内部 loop 回数を決める。`l1_out <= 16` の
-        // とき `n_out_tiles == 1` で out-tile 軸は長さ 1 に縮退する。
-        let n_out_tiles = l1_out.div_ceil(16);
+        self.backward(&mut context)?;
+        self.optimizer_step(&mut context)
+    }
 
-        // batch `b` が workspace 容量に収まることを検証する (固定 batch 前提、
-        // 起動時の `GpuWorkspace::new` で確保済)。
-        self.ws.check_batch_capacity(b)?;
+    fn forward(
+        &mut self,
+        batch: &BatchData,
+        context: &mut StepContext<'_>,
+    ) -> Result<Option<StepOutput>, Box<dyn std::error::Error>> {
+        let StepContext {
+            wdl_lambda,
+            loss,
+            validate,
+            profile_step,
+            b,
+            b_u32,
+            ft_out,
+            l1_out,
+            l1_effective,
+            l2_in,
+            l2_out,
+            n_out_tiles,
+            padded_b: _,
+            ..
+        } = *context;
+        let prof_t0 = &mut *context.prof_t0;
 
         macro_rules! prof_tick {
             ($label:expr) => {
@@ -2233,7 +2309,46 @@ impl GpuTrainer {
             let mut net_output = self.ws.net_output.to_host_vec(&self.stream)?;
             net_output.truncate(b);
             prof_tick!("validate_io");
-            return Ok(StepOutput { loss, net_output });
+            return Ok(Some(StepOutput { loss, net_output }));
+        }
+
+        Ok(None)
+    }
+
+    fn backward(
+        &mut self,
+        context: &mut StepContext<'_>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let StepContext {
+            lr,
+            loss: _,
+            profile_step,
+            b,
+            b_u32,
+            ft_out,
+            l1_out,
+            l1_effective,
+            l2_in,
+            l2_out,
+            n_out_tiles,
+            padded_b,
+            ..
+        } = *context;
+        let prof_t0 = &mut *context.prof_t0;
+
+        macro_rules! prof_tick {
+            ($label:expr) => {
+                if profile_step {
+                    self.stream.synchronize()?;
+                    let now = std::time::Instant::now();
+                    eprintln!(
+                        "[step-profile] {:<10} {:8.3} ms",
+                        $label,
+                        now.duration_since(*prof_t0).as_secs_f64() * 1000.0
+                    );
+                    *prof_t0 = now;
+                }
+            };
         }
 
         // ===== BACKWARD =====
@@ -2242,15 +2357,10 @@ impl GpuTrainer {
         // `memset_async(0)` で既存 buffer を reset (`ft_w_grad` だけで ~450MB の
         // `cudaMalloc`/`cudaFree` を毎 step 走らせるのを避けるため)。
         // `dl1_total` も `slice_scatter_2d` の host 契約 (「dst を 0 初期化」) を守るため reset。
-        let ft_w_n = self.feature_set.train_ft_in() * ft_out;
         let ft_b_n = ft_out;
-        let l1_w_n = self.num_buckets * l1_out * ft_out;
         let l1_b_n = self.num_buckets * l1_out;
-        let l1f_w_n = ft_out * l1_out;
         let l1f_b_n = l1_out;
-        let l2_w_n = self.num_buckets * l2_out * l2_in;
         let l2_b_n = self.num_buckets * l2_out;
-        let l3_w_n = self.num_buckets * l2_out;
         let l3_b_n = self.num_buckets;
         // ft_w_grad の memset_zero は意図的に省略している: phase D iter 0 (stm) の
         // `gather_and_sum_per_feature_overwrite` が実 block の全 (feature, ri) cell
@@ -2332,7 +2442,6 @@ impl GpuTrainer {
                 b_u32, l2_out as u32, 1_u32, self.num_buckets as u32
             ]
         }?;
-        // L3 weight backward
         match self.bucket_layout {
             BucketLayout::Sorted => {
                 let sort = self
@@ -2340,24 +2449,49 @@ impl GpuTrainer {
                     .bucket_sort
                     .as_mut()
                     .expect("Sorted layout requires bucket_sort scratch");
-                cuda_launch! {
-                    kernel: dense_mm_bwd_weight_bucket_indexed,
-                    stream: self.stream,
-                    module: self.module,
-                    config: LaunchConfig {
-                        grid_dim: (l2_out.div_ceil(256) as u32, 64, self.num_buckets as u32),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    },
-                    args: [
-                        slice(self.ws.l2_acted),
-                        slice(self.ws.dy_net_output),
-                        slice(sort.bucket_offsets_dev),
-                        slice(sort.bucket_perm_dev),
-                        slice(self.l3_w_grad),
-                        l2_out as u32, 1_u32, self.num_buckets as u32
-                    ]
-                }?;
+                if self.num_buckets <= TILED_REGISTER_BUCKET_MAX {
+                    let mut l3_lanes = 1_usize;
+                    while l3_lanes * 2 * l2_out <= 256 {
+                        l3_lanes *= 2;
+                    }
+                    let l3_block = (l3_lanes * l2_out) as u32;
+                    cuda_launch! {
+                        kernel: dense_mm_bwd_weight_bucket_tiled_l3,
+                        stream: self.stream,
+                        module: self.module,
+                        config: LaunchConfig {
+                            grid_dim: (256, 1, 1),
+                            block_dim: (l3_block, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        args: [
+                            slice(self.ws.l2_acted),
+                            slice(self.ws.dy_net_output),
+                            slice(self.ws.bucket_idx_dev),
+                            slice(self.l3_w_grad),
+                            b_u32, l2_out as u32, 1_u32, self.num_buckets as u32
+                        ]
+                    }?;
+                } else {
+                    cuda_launch! {
+                        kernel: dense_mm_bwd_weight_bucket_indexed,
+                        stream: self.stream,
+                        module: self.module,
+                        config: LaunchConfig {
+                            grid_dim: (l2_out.div_ceil(256) as u32, 64, self.num_buckets as u32),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        args: [
+                            slice(self.ws.l2_acted),
+                            slice(self.ws.dy_net_output),
+                            slice(sort.bucket_offsets_dev),
+                            slice(sort.bucket_perm_dev),
+                            slice(self.l3_w_grad),
+                            l2_out as u32, 1_u32, self.num_buckets as u32
+                        ]
+                    }?;
+                }
             }
             BucketLayout::Direct => {
                 cuda_launch! {
@@ -2422,7 +2556,6 @@ impl GpuTrainer {
                 b_u32, l2_in as u32, l2_out as u32, self.num_buckets as u32
             ]
         }?;
-        // L2 weight + bias backward
         match self.bucket_layout {
             BucketLayout::Sorted => {
                 let sort = self
@@ -2431,28 +2564,48 @@ impl GpuTrainer {
                     .as_mut()
                     .expect("Sorted layout requires bucket_sort scratch");
                 let padded_b = sort.padded_batch(b, self.num_buckets);
-                cuda_launch! {
-                    kernel: dense_mm_bwd_weight_bucket_indexed,
-                    stream: self.stream,
-                    module: self.module,
-                    config: LaunchConfig {
-                        grid_dim: (
-                            (l2_out * l2_in).div_ceil(256) as u32,
-                            64,
-                            self.num_buckets as u32,
-                        ),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    },
-                    args: [
-                        slice(self.ws.l2_input),
-                        slice(self.ws.dl2_out),
-                        slice(sort.bucket_offsets_dev),
-                        slice(sort.bucket_perm_dev),
-                        slice(self.l2_w_grad),
-                        l2_in as u32, l2_out as u32, self.num_buckets as u32
-                    ]
-                }?;
+                if self.num_buckets <= TILED_REGISTER_BUCKET_MAX {
+                    cuda_launch! {
+                        kernel: dense_mm_bwd_weight_bucket_tiled_l2,
+                        stream: self.stream,
+                        module: self.module,
+                        config: LaunchConfig {
+                            grid_dim: ((l2_out * l2_in).div_ceil(256) as u32, 256, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        args: [
+                            slice(self.ws.l2_input),
+                            slice(self.ws.dl2_out),
+                            slice(self.ws.bucket_idx_dev),
+                            slice(self.l2_w_grad),
+                            b_u32, l2_in as u32, l2_out as u32, self.num_buckets as u32
+                        ]
+                    }?;
+                } else {
+                    cuda_launch! {
+                        kernel: dense_mm_bwd_weight_bucket_indexed,
+                        stream: self.stream,
+                        module: self.module,
+                        config: LaunchConfig {
+                            grid_dim: (
+                                (l2_out * l2_in).div_ceil(256) as u32,
+                                64,
+                                self.num_buckets as u32,
+                            ),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        args: [
+                            slice(self.ws.l2_input),
+                            slice(self.ws.dl2_out),
+                            slice(sort.bucket_offsets_dev),
+                            slice(sort.bucket_perm_dev),
+                            slice(self.l2_w_grad),
+                            l2_in as u32, l2_out as u32, self.num_buckets as u32
+                        ]
+                    }?;
+                }
                 cuda_launch! {
                     kernel: permute_rows_f32,
                     stream: self.stream, module: self.module,
@@ -2665,23 +2818,6 @@ impl GpuTrainer {
 
         prof_tick!("bwd_L1f");
 
-        // -- Backward 4 reverse: L1 per-bucket dense grad (input)。`dense_mm_bwd_input_bucket`
-        //    は out_dim を runtime arg で受ける汎用 kernel なので l1_out 不問で分岐不要。
-        cuda_launch! {
-            kernel: dense_mm_bwd_input_bucket,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(b * ft_out),
-            args: [
-                slice(self.ws.dl1_total),
-                slice(self.l1_w),
-                slice(self.ws.bucket_idx_dev),
-                slice_mut(self.ws.dcombined_from_l1),
-                b_u32, ft_out as u32, l1_out as u32, self.num_buckets as u32
-            ]
-        }?;
-        prof_tick!("bwd_L1_inB");
-        // L1 weight + bias backward
         match self.bucket_layout {
             BucketLayout::Sorted => {
                 let sort = self
@@ -2725,6 +2861,25 @@ impl GpuTrainer {
                 }?;
                 prof_tick!("bwd_L1_wB");
                 cuda_launch! {
+                    kernel: dense_mm_bwd_input_bucket_tiled_sorted_scatter,
+                    stream: self.stream,
+                    module: self.module,
+                    config: LaunchConfig {
+                        grid_dim: ((ft_out / 16) as u32, (padded_b / 16) as u32, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    args: [
+                        slice(sort.dl1_total_sorted),
+                        slice(self.l1_w),
+                        slice(sort.bucket_idx_sorted_dev),
+                        slice(sort.bucket_perm_dev),
+                        slice_mut(self.ws.dcombined_from_l1),
+                        padded_b as u32, ft_out as u32, l1_out as u32, self.num_buckets as u32
+                    ]
+                }?;
+                prof_tick!("bwd_L1_inB");
+                cuda_launch! {
                     kernel: bias_grad_bucket_shared_sorted,
                     stream: self.stream,
                     module: self.module,
@@ -2742,6 +2897,20 @@ impl GpuTrainer {
                 }?;
             }
             BucketLayout::Direct => {
+                cuda_launch! {
+                    kernel: dense_mm_bwd_input_bucket,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * ft_out),
+                    args: [
+                        slice(self.ws.dl1_total),
+                        slice(self.l1_w),
+                        slice(self.ws.bucket_idx_dev),
+                        slice_mut(self.ws.dcombined_from_l1),
+                        b_u32, ft_out as u32, l1_out as u32, self.num_buckets as u32
+                    ]
+                }?;
+                prof_tick!("bwd_L1_inB");
                 cuda_launch! {
                     kernel: dense_mm_bwd_weight_bucket_unsorted,
                     stream: self.stream,
@@ -2876,7 +3045,8 @@ impl GpuTrainer {
         // 各 (b, ri) thread が直接 38 atomic add する素朴版は atomic contention で memory
         // bandwidth が飽和するため、phase A (count) → B (prefix sum) → C (scatter) →
         // D (per-feature gather+sum) の inverse-index 構成にして atomic を D だけに局所化する。
-        // ft_w_grad は host が memset_zero 済、phase D は atomic add で stm/nstm を合算。
+        // phase D iter 0 (stm) は overwrite で全 cell を書き、iter 1 (nstm) が atomic add で
+        // 合算するため、ft_w_grad は host 事前 memset 不要 (overwrite が前回値を上書きする)。
         // `gout` (dft) は phase D でのみ使うため loop は idx_dev のみで回し、phase D で
         // iter_idx に対応する dft buffer を選ぶ (`ft_fp16_out` 時は f16 版)。
         // feature set 依存の次元を loop 前に読み出す (per-iter の field 借用を避ける)。
@@ -2904,7 +3074,26 @@ impl GpuTrainer {
                 ]
             }?;
             prof_tick!("phA_count");
-            // B: exclusive_prefix_sum_small (1 block × 1024 threads, ft_in ≈ 73K)
+            // B: feat_counts の exclusive prefix sum (multi-block scan で全 SM を使う)。
+            // 単一 block scan は 1 SM 律速 (ft_in ≈ 73K-138K で大半 idle) のため 3 段に分割。
+            let prefix_blocks = ft_in.div_ceil(1024) as u32;
+            // level 1: 各 block が連続 1024 要素を block-local scan、block 総和を emit。
+            cuda_launch! {
+                kernel: prefix_sum_block_local,
+                stream: self.stream, module: self.module,
+                config: LaunchConfig {
+                    grid_dim: (prefix_blocks, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [
+                    slice(self.ws.feat_counts),
+                    slice(self.ws.feat_offsets),
+                    slice(self.ws.feat_block_sums),
+                    ft_in as u32
+                ]
+            }?;
+            // level 2: block 総和列 (prefix_blocks ≲ 135 要素) を単一 block で scan。
             cuda_launch! {
                 kernel: exclusive_prefix_sum_small,
                 stream: self.stream, module: self.module,
@@ -2914,9 +3103,25 @@ impl GpuTrainer {
                     shared_mem_bytes: 0,
                 },
                 args: [
-                    slice(self.ws.feat_counts),
+                    slice(self.ws.feat_block_sums),
+                    slice(self.ws.feat_block_offsets),
+                    prefix_blocks
+                ]
+            }?;
+            // level 3: block-local offsets へ block offset を加算 + offsets[n]=total。
+            cuda_launch! {
+                kernel: prefix_sum_add_block_offset,
+                stream: self.stream, module: self.module,
+                config: LaunchConfig {
+                    grid_dim: (prefix_blocks, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [
                     slice(self.ws.feat_offsets),
-                    ft_in as u32
+                    slice(self.ws.feat_block_offsets),
+                    ft_in as u32,
+                    prefix_blocks
                 ]
             }?;
             prof_tick!("phB_psum");
@@ -2936,7 +3141,7 @@ impl GpuTrainer {
             prof_tick!("phC_scat");
             // D: gather_and_sum_per_feature。block grid = (ft_in, ft_out/128), block_dim=128.
             // 1 回目 (stm) は overwrite、2 回目 (nstm) は atomic add で stm 結果に加算。
-            // host は grad_w を memset_zero 済みだが、overwrite kernel は全 cell を書き切る。
+            // overwrite kernel が全 cell を書き切るため grad_w の host 事前 memset は不要。
             let d_config = LaunchConfig {
                 grid_dim: (ft_in as u32, (ft_out / 128) as u32, 1),
                 block_dim: (128, 1, 1),
@@ -3096,6 +3301,49 @@ impl GpuTrainer {
             norm_loss_group!(self.l2_b, 1, 0, 1, l2_b_n);
             norm_loss_group!(self.l3_b, 1, 0, 1, l3_b_n);
             prof_tick!("norm_loss");
+        }
+
+        Ok(())
+    }
+
+    fn optimizer_step(
+        &mut self,
+        context: &mut StepContext<'_>,
+    ) -> Result<StepOutput, Box<dyn std::error::Error>> {
+        let StepContext {
+            lr,
+            profile_step,
+            ft_out,
+            l1_out,
+            l2_in,
+            l2_out,
+            ..
+        } = *context;
+        let prof_t0 = &mut *context.prof_t0;
+        let ft_w_n = self.feature_set.train_ft_in() * ft_out;
+        let ft_b_n = ft_out;
+        let l1_w_n = self.num_buckets * l1_out * ft_out;
+        let l1_b_n = self.num_buckets * l1_out;
+        let l1f_w_n = ft_out * l1_out;
+        let l1f_b_n = l1_out;
+        let l2_w_n = self.num_buckets * l2_out * l2_in;
+        let l2_b_n = self.num_buckets * l2_out;
+        let l3_w_n = self.num_buckets * l2_out;
+        let l3_b_n = self.num_buckets;
+
+        macro_rules! prof_tick {
+            ($label:expr) => {
+                if profile_step {
+                    self.stream.synchronize()?;
+                    let now = std::time::Instant::now();
+                    eprintln!(
+                        "[step-profile] {:<10} {:8.3} ms",
+                        $label,
+                        now.duration_since(*prof_t0).as_secs_f64() * 1000.0
+                    );
+                    *prof_t0 = now;
+                }
+            };
         }
 
         // ===== OPTIMIZER STEP (Ranger = RAdam + Lookahead) =====
@@ -3387,108 +3635,16 @@ impl GpuTrainer {
 // TrainerBackend impl — `nnue-train::trainer::run` から 1 batch ずつ呼ばれる
 // ===========================================================================
 
-impl TrainerBackend for GpuTrainer {
-    fn train_step(
-        &mut self,
-        batch: &Batch,
-        bucket_idx: &[i32],
-        lr: f32,
-        wdl_lambda: f32,
-        loss: LossKind,
-    ) -> std::io::Result<f64> {
-        // dataloader が出した batch の feature set が trainer 構築時に選んだ feature set
-        // と一致することを確認する (buffer サイズ / kernel launch 次元が前者を前提に
-        // 確保済のため、不一致は out-of-bounds になる)。
-        if batch.feature_set != self.feature_set {
-            return Err(std::io::Error::other(format!(
-                "batch feature set '{}' does not match trainer feature set '{}'",
-                batch.feature_set.canonical_name(),
-                self.feature_set.canonical_name()
-            )));
-        }
-        let data = BatchData::from_batch_ref(batch, bucket_idx);
-        self.step(&data, lr, wdl_lambda, loss)
-            .map_err(|e| std::io::Error::other(format!("GpuTrainer::step failed: {e}")))
-    }
-
-    fn validate_step(
-        &mut self,
-        batch: &Batch,
-        bucket_idx: &[i32],
-        wdl_lambda: f32,
-        loss: LossKind,
-    ) -> std::io::Result<ValidationStepOutput> {
-        // train_step と同じく batch の feature set が trainer の feature set と
-        // 一致することを確認する (GPU buffer / kernel 次元の前提)。
-        if batch.feature_set != self.feature_set {
-            return Err(std::io::Error::other(format!(
-                "batch feature set '{}' does not match trainer feature set '{}'",
-                batch.feature_set.canonical_name(),
-                self.feature_set.canonical_name()
-            )));
-        }
-        let data = BatchData::from_batch_ref(batch, bucket_idx);
-        let out = self
-            .validate(&data, wdl_lambda, loss)
-            .map_err(|e| std::io::Error::other(format!("GpuTrainer::validate failed: {e}")))?;
-        Ok(ValidationStepOutput {
-            sum_sq_err: out.loss,
-            net_output: out.net_output,
-        })
-    }
-
-    fn flush_pending_loss(&mut self) -> std::io::Result<f64> {
-        self.loss_ring.flush_pending_loss().map_err(|e| {
-            std::io::Error::other(format!(
-                "GpuTrainer::loss_ring.flush_pending_loss failed: {e}"
-            ))
-        })
-    }
-
-    fn save_checkpoint(&mut self, path: &Path) -> std::io::Result<()> {
-        let weights = self.to_layerstack_weights().map_err(|e| {
-            std::io::Error::other(format!("GpuTrainer::to_layerstack_weights failed: {e}"))
-        })?;
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
-        weights.save_quantised(&mut writer)?;
-        writer.flush()?;
-        Ok(())
-    }
-
-    fn save_resume_checkpoint(
-        &mut self,
-        path: &Path,
-        superbatch: usize,
-        run_id: &str,
-        lr_horizon: Option<usize>,
-    ) -> std::io::Result<()> {
-        self.save_raw_checkpoint(path, superbatch, run_id, lr_horizon)
-            .map_err(|e| {
-                // 既に io::Error なら kind を保つ、それ以外は other で包む。
-                match e.downcast::<std::io::Error>() {
-                    Ok(io_err) => *io_err,
-                    Err(other) => std::io::Error::other(format!(
-                        "GpuTrainer::save_raw_checkpoint failed: {other}"
-                    )),
-                }
-            })
-    }
-
-    fn read_fp16_clamp_count(&mut self) -> std::io::Result<(u64, u64)> {
-        // `to_host_vec` 内部で `stream.synchronize` する (`AsyncLossRing` と違って
-        // pinned host ring を介さない 1-shot D2H で十分、cumulative counter の sb 末
-        // 報告は同期 path で OK)。
-        let host = self
-            .fp16_clamp_counter
-            .to_host_vec(&self.stream)
-            .map_err(|e| std::io::Error::other(format!("clamp counter D2H failed: {e}")))?;
-        Ok((host[0], self.fp16_clamp_elems_written))
-    }
+trainer_backend_impl! {
+    trainer: GpuTrainer,
+    feature_set: feature_set,
+    batch: bucketed,
+    weights: to_layerstack_weights,
+    step_error: "GpuTrainer::step failed: {}",
+    validate_error: "GpuTrainer::validate failed: {}",
+    flush_error: "GpuTrainer::loss_ring.flush_pending_loss failed: {}",
+    weights_error: "GpuTrainer::to_layerstack_weights failed: {}",
+    resume_error: "GpuTrainer::save_raw_checkpoint failed: {}",
 }
 
 #[cfg(test)]

@@ -120,9 +120,13 @@ pub fn loss_wdl(
 /// (= host が f32 で計算した `1/n`) と最終 bit が一致しない。extended の既定値
 /// (`pow_exp=2 / qp_asymmetry=0 / w1=0`) では caller が `extended=0` を渡す。
 ///
-/// 1 thread = 1 position。`dl_dout` は排他更新 (atomics 不要)、`loss_acc` は f64 単一
-/// cell の `DeviceAtomicF64::fetch_add` (`loss_wdl` と同型)。`f32::exp` / `f32::powf` /
-/// `f32::abs` は libdevice (`__nv_expf` / `__nv_powf` / `__nv_fabsf`) に lowering OK。
+/// 1 thread = 1 position。`dl_dout` (= 訓練に使う勾配) は per-position 排他更新 (atomics 不要)。
+/// `loss_acc` (ログ表示用の loss 値) は block 内 partial を shared-mem tree reduction で集約し
+/// block あたり 1 回だけ `DeviceAtomicF64::fetch_add` する (single-cell への atomic 競合回避)。
+/// f64 reduction は加算順に依存し loss 値の最下位 bit (~1e-15 rel) が動くが、grad は `loss_acc` を
+/// 読まない (per-position に別書き) ので影響を受けない。`f32::exp` / `f32::powf` / `f32::abs` は
+/// libdevice (`__nv_expf` / `__nv_powf` / `__nv_fabsf`) に lowering OK。block_dim は BLOCK_DIM (256)
+/// の 2 冪前提 (tree reduction が完全に畳める)。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn loss_wrm(
@@ -146,68 +150,102 @@ pub fn loss_wrm(
     extended: u32,     // 0 = 二乗誤差 (bit-identical)、1 = nnue-pytorch 一般化 loss
     n: u32,
 ) {
+    use core::ptr::addr_of_mut;
+    // block 内 partial loss を shared-mem tree reduction で集約し、`loss_acc` への atomic は
+    // block あたり 1 回だけにする (block_dim == BLOCK_DIM = 256)。out-of-range thread は寄与 0 で
+    // reduction に参加する (sync_threads を全 thread が一様に通すため early return しない)。
+    static mut PARTIAL: SharedArray<f64, 256> = SharedArray::UNINIT;
     let i = thread::index_1d();
-    if i.get() >= n as usize {
-        return;
-    }
-    // --- target (WRM applied to teacher score、offset/scaling は caller 指定) ---
-    let s = score[i.get()];
-    let sig_pt = 1.0_f32 / (1.0_f32 + (-((s - target_offset) / target_scaling)).exp());
-    let sig_pmt = 1.0_f32 / (1.0_f32 + (-((-s - target_offset) / target_scaling)).exp());
-    let target_wrm = 0.5_f32 * (1.0_f32 + sig_pt - sig_pmt);
-    let target = lambda * wdl[i.get()] + (1.0_f32 - lambda) * target_wrm;
+    let tid = thread::threadIdx_x() as usize;
+    let valid = i.get() < n as usize;
 
-    // --- prediction (WRM applied to net output) ---
-    let scorenet = out[i.get()] * nnue2score;
-    let q = 1.0_f32 / (1.0_f32 + (-((scorenet - in_offset) / in_scaling)).exp());
-    let qm = 1.0_f32 / (1.0_f32 + (-((-scorenet - in_offset) / in_scaling)).exp());
-    let qf = 0.5_f32 * (1.0_f32 + q - qm);
+    // 本 thread の loss 寄与 (out-of-range は 0)。grad `dl_dout` は valid thread のみ排他更新で
+    // atomics 不要、loss reduction とは独立 (loss_acc を読まない)。
+    let mut contrib = 0.0_f64;
+    if valid {
+        // --- target (WRM applied to teacher score、offset/scaling は caller 指定) ---
+        let s = score[i.get()];
+        let sig_pt = 1.0_f32 / (1.0_f32 + (-((s - target_offset) / target_scaling)).exp());
+        let sig_pmt = 1.0_f32 / (1.0_f32 + (-((-s - target_offset) / target_scaling)).exp());
+        let target_wrm = 0.5_f32 * (1.0_f32 + sig_pt - sig_pmt);
+        let target = lambda * wdl[i.get()] + (1.0_f32 - lambda) * target_wrm;
 
-    let err = qf - target;
+        // --- prediction (WRM applied to net output) ---
+        let scorenet = out[i.get()] * nnue2score;
+        let q = 1.0_f32 / (1.0_f32 + (-((scorenet - in_offset) / in_scaling)).exp());
+        let qm = 1.0_f32 / (1.0_f32 + (-((-scorenet - in_offset) / in_scaling)).exp());
+        let qf = 0.5_f32 * (1.0_f32 + q - qm);
 
-    // SAFETY: `loss_acc.len() == 1`、host 側で f64 単一 cell 確保済 (`loss_wdl` と同型)。
-    let loss_atom = unsafe { &*(loss_acc.as_ptr() as *const DeviceAtomicF64) };
+        let err = qf - target;
 
-    if extended == 0 {
-        // default 経路は元の二乗誤差式をそのまま保持する (f32 乗算は非結合則なので項を
-        // くくり出すと最終 bit が変わる、bit-identical 要件のため式を変えない)。
-        let norm = per_pos_norm;
-        if let Some(g) = dl_dout.get_mut(i) {
-            *g = err * (nnue2score / in_scaling) * (q * (1.0_f32 - q) + qm * (1.0_f32 - qm)) * norm;
+        if extended == 0 {
+            // 二乗誤差 grad は項の順序・grouping をそのまま評価する (f32 乗算は非結合則で、
+            // くくり出すと最終 bit が変わり量子化出力の bit 再現に効くため)。
+            let norm = per_pos_norm;
+            if let Some(g) = dl_dout.get_mut(i) {
+                *g = err
+                    * (nnue2score / in_scaling)
+                    * (q * (1.0_f32 - q) + qm * (1.0_f32 - qm))
+                    * norm;
+            }
+            contrib = (err as f64) * (err as f64);
+        } else {
+            // --- extended: nnue-pytorch 一般化 loss (weight boost / pow_exp / asymmetry) ---
+            let pf = target_wrm;
+            let wb_base = (pf - 0.5_f32) * (pf - 0.5_f32) * pf * (1.0_f32 - pf);
+            let weight =
+                1.0_f32 + (2.0_f32.powf(weight_boost_w1) - 1.0_f32) * wb_base.powf(weight_boost_w2);
+            let asym = if qf > target {
+                1.0_f32 + qp_asymmetry
+            } else {
+                1.0_f32
+            };
+            let abs_err = err.abs();
+            // sign(err) * |err|^(pow_exp-1): err=0 では pow_exp>1 で 0、符号は err の符号。
+            // pow_exp=1 (L1) は原点で subgradient +1 を返す (実害は測度 0 の点のみ)。
+            let pow_abs = abs_err.powf(pow_exp - 1.0_f32);
+            let signed_pow = if err < 0.0_f32 { -pow_abs } else { pow_abs };
+
+            // Σw を読む (先行 launch の wrm_weight_sum が書込済、本 kernel では read only)。
+            // host validation が w1,w2 >= 0 を保証するので weight >= 1、Σw >= n > 0 (n は本
+            // kernel が launch される batch サイズで >= 1) ゆえ除算は安全。
+            let inv_sum_w = (1.0_f64 / sum_w_acc[0]) as f32;
+            // dqf/dout = 0.5 * (nnue2score/in_scaling) * (q(1-q)+qm(1-qm))。
+            let dqf_dout =
+                0.5_f32 * (nnue2score / in_scaling) * (q * (1.0_f32 - q) + qm * (1.0_f32 - qm));
+
+            if let Some(g) = dl_dout.get_mut(i) {
+                *g = (weight * inv_sum_w) * (asym * pow_exp * signed_pow) * dqf_dout;
+            }
+
+            contrib = (asym * abs_err.powf(pow_exp) * weight * (n as f32) * inv_sum_w) as f64;
         }
-        loss_atom.fetch_add((err as f64) * (err as f64), AtomicOrdering::Relaxed);
-        return;
     }
 
-    // --- extended: nnue-pytorch 一般化 loss (weight boost / pow_exp / asymmetry) ---
-    let pf = target_wrm;
-    let wb_base = (pf - 0.5_f32) * (pf - 0.5_f32) * pf * (1.0_f32 - pf);
-    let weight =
-        1.0_f32 + (2.0_f32.powf(weight_boost_w1) - 1.0_f32) * wb_base.powf(weight_boost_w2);
-    let asym = if qf > target {
-        1.0_f32 + qp_asymmetry
-    } else {
-        1.0_f32
-    };
-    let abs_err = err.abs();
-    // sign(err) * |err|^(pow_exp-1): err=0 では pow_exp>1 で 0、符号は err の符号。
-    // pow_exp=1 (L1) は原点で subgradient +1 を返す (実害は測度 0 の点のみ)。
-    let pow_abs = abs_err.powf(pow_exp - 1.0_f32);
-    let signed_pow = if err < 0.0_f32 { -pow_abs } else { pow_abs };
-
-    // Σw を読む (先行 launch の wrm_weight_sum が書込済、本 kernel では read only)。
-    // host validation が w1,w2 >= 0 を保証するので weight >= 1、Σw >= n > 0 (n は本 kernel
-    // が launch される batch サイズで >= 1) ゆえ除算は安全。
-    let inv_sum_w = (1.0_f64 / sum_w_acc[0]) as f32;
-    // dqf/dout = 0.5 * (nnue2score/in_scaling) * (q(1-q)+qm(1-qm))。
-    let dqf_dout = 0.5_f32 * (nnue2score / in_scaling) * (q * (1.0_f32 - q) + qm * (1.0_f32 - qm));
-
-    if let Some(g) = dl_dout.get_mut(i) {
-        *g = (weight * inv_sum_w) * (asym * pow_exp * signed_pow) * dqf_dout;
+    // loss_acc は単一 cell ゆえ全 thread が直接 atomic add すると競合する。block 内で contrib を
+    // tree reduction し、block 0 番 thread が block あたり 1 atomic だけ打って競合を block 数に抑える。
+    let partial_ptr: *mut f64 = addr_of_mut!(PARTIAL) as *mut f64;
+    unsafe {
+        partial_ptr.add(tid).write(contrib);
     }
-
-    let loss_i = asym * abs_err.powf(pow_exp) * weight * (n as f32) * inv_sum_w;
-    loss_atom.fetch_add(loss_i as f64, AtomicOrdering::Relaxed);
+    thread::sync_threads();
+    let mut stride = (thread::blockDim_x() as usize) / 2;
+    while stride >= 1 {
+        if tid < stride {
+            let v = unsafe { partial_ptr.add(tid).read() + partial_ptr.add(tid + stride).read() };
+            unsafe {
+                partial_ptr.add(tid).write(v);
+            }
+        }
+        thread::sync_threads();
+        stride /= 2;
+    }
+    if tid == 0 {
+        // SAFETY: `loss_acc.len() == 1`、host 側で f64 単一 cell 確保済 (`loss_wdl` と同型)。
+        let loss_atom = unsafe { &*(loss_acc.as_ptr() as *const DeviceAtomicF64) };
+        let block_sum = unsafe { partial_ptr.add(0).read() };
+        loss_atom.fetch_add(block_sum, AtomicOrdering::Relaxed);
+    }
 }
 
 /// extended WRM loss の per-position weight `w = 1 + (2^w1 - 1) * ((pf-0.5)^2 *
@@ -249,55 +287,145 @@ pub fn wrm_weight_sum(
     sum_atom.fetch_add(weight as f64, AtomicOrdering::Relaxed);
 }
 
-/// Fused AdamW optimizer step。
-///
-/// LayerStack path では **未使用** (Ranger 使用)。cuda-oxide の bin-entry constraint に従い
-/// compile-reach のため preserve。
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::manual_clamp)]
-#[kernel]
-pub fn adamw_step(
-    mut weights: DisjointSlice<f32>,
-    mut m: DisjointSlice<f32>,
-    mut v: DisjointSlice<f32>,
-    mut grad: DisjointSlice<f32>,
-    lr: f32,
-    decay: f32,
-    beta1: f32,
-    beta2: f32,
-    eps: f32,
-    min_w: f32,
-    max_w: f32,
-    n: u32,
-) {
-    let i = thread::index_1d();
-    if i.get() >= n as usize {
-        return;
-    }
-    let g_opt = grad.get_mut(i);
-    let m_opt = m.get_mut(i);
-    let v_opt = v.get_mut(i);
-    let w_opt = weights.get_mut(i);
-    if let (Some(g_ref), Some(m_ref), Some(v_ref), Some(w_ref)) = (g_opt, m_opt, v_opt, w_opt) {
-        let g = *g_ref;
-        let mut p = *w_ref;
-        p *= 1.0_f32 - decay * lr;
-        let mi = beta1 * *m_ref + (1.0_f32 - beta1) * g;
-        let vi = beta2 * *v_ref + (1.0_f32 - beta2) * g * g;
-        *m_ref = mi;
-        *v_ref = vi;
-        let val = mi / (vi.sqrt() + eps);
-        p -= lr * val;
-        let p_clamped = if p < min_w {
-            min_w
-        } else if p > max_w {
-            max_w
+macro_rules! radam_update_moments {
+    (f32, $m_ref:ident, $v_ref:ident, $g:ident, $beta1:ident, $beta2:ident) => {{
+        let mi = $beta1 * *$m_ref + (1.0_f32 - $beta1) * $g;
+        let vi = $beta2 * *$v_ref + (1.0_f32 - $beta2) * $g * $g;
+        *$m_ref = mi;
+        *$v_ref = vi;
+        (mi, vi)
+    }};
+    (
+        f16,
+        $m_ref:ident,
+        $v_ref:ident,
+        $g:ident,
+        $beta1:ident,
+        $beta2:ident,
+        $m_scale:ident,
+        $v_scale:ident
+    ) => {{
+        // f16 格納値を真値へ割り戻す (scale は power-of-2 なので除算は無誤差)。
+        let m_prev = (*$m_ref as f32) / $m_scale;
+        let v_prev = (*$v_ref as f32) / $v_scale;
+        let mi = $beta1 * m_prev + (1.0_f32 - $beta1) * $g;
+        let vi = $beta2 * v_prev + (1.0_f32 - $beta2) * $g * $g;
+        // 格納: scale 後 f16 有限域に clamp してから半精度化。
+        let ms = mi * $m_scale;
+        let ms_c = if ms > 65504.0_f32 {
+            65504.0_f32
+        } else if ms < -65504.0_f32 {
+            -65504.0_f32
         } else {
-            p
+            ms
         };
-        *w_ref = p_clamped;
-        *g_ref = 0.0_f32;
-    }
+        *$m_ref = ms_c as f16;
+        let vs = vi * $v_scale;
+        let vs_c = if vs > 65504.0_f32 {
+            65504.0_f32
+        } else {
+            vs
+        };
+        *$v_ref = vs_c as f16;
+        // val は本 step の真値 mi / vi で計算する (f16 丸めは次 step の read で 1 回だけ入る)。
+        (mi, vi)
+    }};
+}
+
+macro_rules! radam_finish {
+    (
+        $grad_mode:ident,
+        $mirror_mode:ident,
+        $i:ident,
+        $g_ref:ident,
+        $p_clamped:ident
+        $(, $mirror:ident)?
+    ) => {
+        radam_finish!(@grad $grad_mode, $g_ref);
+        radam_finish!(@mirror $mirror_mode, $i, $p_clamped $(, $mirror)?);
+    };
+    (@grad reset, $g_ref:ident) => {
+        *$g_ref = 0.0_f32;
+    };
+    (@grad keep_grad, $g_ref:ident) => {
+        // ft_w_grad は毎 step backward (overwrite-gather、factorizer 有効時は仮想行を
+        // `ft_reduce_virtual_grad`) が全 cell を書き直すため、ここで grad を 0 に戻さない
+        // (戻しても次 read 前に上書きされ DRAM 書き込みを浪費するだけ)。
+        // 通常の radam_step は atomic 累積 group で次 step 前の zero-out が必須。
+    };
+    (@mirror no_mirror, $i:ident, $p_clamped:ident) => {
+    };
+    (@mirror mirror, $i:ident, $p_clamped:ident, $mirror:ident) => {
+        // SAFETY: `mirror` は他の buffer と同要素数で別 alloc (caller 保証)。
+        // kernel 冒頭で `i < n` を確認し、各 thread は自分の `i` のみ書く。
+        let mirror_ptr = $mirror.as_mut_ptr();
+        unsafe {
+            mirror_ptr.add($i.get()).write($p_clamped as f16);
+        }
+    };
+}
+
+// RAdam kernel の各変種で decay、moment 更新、denom 分岐、clamp のコアを共有する。
+macro_rules! radam_step_body {
+    (
+        $weights:ident,
+        $m:ident,
+        $v:ident,
+        $grad:ident,
+        $lr:ident,
+        $step_size:ident,
+        $denom:ident,
+        $decay:ident,
+        $beta1:ident,
+        $beta2:ident,
+        $eps:ident,
+        $min_w:ident,
+        $max_w:ident,
+        $n:ident;
+        $state:ident $(, $m_scale:ident, $v_scale:ident)?;
+        $grad_mode:ident, $mirror_mode:ident $(, $mirror:ident)?
+    ) => {
+        let i = thread::index_1d();
+        if i.get() >= $n as usize {
+            return;
+        }
+        let g_opt = $grad.get_mut(i);
+        let m_opt = $m.get_mut(i);
+        let v_opt = $v.get_mut(i);
+        let w_opt = $weights.get_mut(i);
+        if let (Some(g_ref), Some(m_ref), Some(v_ref), Some(w_ref)) =
+            (g_opt, m_opt, v_opt, w_opt)
+        {
+            let g = *g_ref;
+            let rate = $lr * $step_size;
+            let mut p = *w_ref;
+            p *= 1.0_f32 - $decay * rate;
+            let (mi, vi) = radam_update_moments!(
+                $state, m_ref, v_ref, g, $beta1, $beta2 $(, $m_scale, $v_scale)?
+            );
+            let mut val = mi;
+            if $denom != 0 {
+                val /= vi.sqrt() + $eps;
+            }
+            p -= rate * val;
+            let p_clamped = if p < $min_w {
+                $min_w
+            } else if p > $max_w {
+                $max_w
+            } else {
+                p
+            };
+            *w_ref = p_clamped;
+            radam_finish!(
+                $grad_mode,
+                $mirror_mode,
+                i,
+                g_ref,
+                p_clamped
+                $(, $mirror)?
+            );
+        }
+    };
 }
 
 /// Fused RAdam optimizer step。
@@ -323,38 +451,11 @@ pub fn radam_step(
     max_w: f32,
     n: u32,
 ) {
-    let i = thread::index_1d();
-    if i.get() >= n as usize {
-        return;
-    }
-    let g_opt = grad.get_mut(i);
-    let m_opt = m.get_mut(i);
-    let v_opt = v.get_mut(i);
-    let w_opt = weights.get_mut(i);
-    if let (Some(g_ref), Some(m_ref), Some(v_ref), Some(w_ref)) = (g_opt, m_opt, v_opt, w_opt) {
-        let g = *g_ref;
-        let rate = lr * step_size;
-        let mut p = *w_ref;
-        p *= 1.0_f32 - decay * rate;
-        let mi = beta1 * *m_ref + (1.0_f32 - beta1) * g;
-        let vi = beta2 * *v_ref + (1.0_f32 - beta2) * g * g;
-        *m_ref = mi;
-        *v_ref = vi;
-        let mut val = mi;
-        if denom != 0 {
-            val /= vi.sqrt() + eps;
-        }
-        p -= rate * val;
-        let p_clamped = if p < min_w {
-            min_w
-        } else if p > max_w {
-            max_w
-        } else {
-            p
-        };
-        *w_ref = p_clamped;
-        *g_ref = 0.0_f32;
-    }
+    radam_step_body!(
+        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n;
+        f32;
+        reset, no_mirror
+    );
 }
 
 /// `radam_step` の FP16 mirror 同時更新 variant (`--ft-fp16` の `ft_w` 専用)。
@@ -384,42 +485,11 @@ pub fn radam_step_fp16_mirror(
     max_w: f32,
     n: u32,
 ) {
-    let i = thread::index_1d();
-    if i.get() >= n as usize {
-        return;
-    }
-    let g_opt = grad.get_mut(i);
-    let m_opt = m.get_mut(i);
-    let v_opt = v.get_mut(i);
-    let w_opt = weights.get_mut(i);
-    if let (Some(g_ref), Some(m_ref), Some(v_ref), Some(w_ref)) = (g_opt, m_opt, v_opt, w_opt) {
-        let g = *g_ref;
-        let rate = lr * step_size;
-        let mut p = *w_ref;
-        p *= 1.0_f32 - decay * rate;
-        let mi = beta1 * *m_ref + (1.0_f32 - beta1) * g;
-        let vi = beta2 * *v_ref + (1.0_f32 - beta2) * g * g;
-        *m_ref = mi;
-        *v_ref = vi;
-        let mut val = mi;
-        if denom != 0 {
-            val /= vi.sqrt() + eps;
-        }
-        p -= rate * val;
-        let p_clamped = if p < min_w {
-            min_w
-        } else if p > max_w {
-            max_w
-        } else {
-            p
-        };
-        *w_ref = p_clamped;
-        *g_ref = 0.0_f32;
-        let mirror_ptr = mirror.as_mut_ptr();
-        unsafe {
-            mirror_ptr.add(i.get()).write(p_clamped as f16);
-        }
-    }
+    radam_step_body!(
+        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n;
+        f32;
+        keep_grad, mirror, mirror
+    );
 }
 
 /// Norm loss (Georgiou et al. 2021) の per-weight-group sumsq 計算 (reduce pass)。
@@ -569,53 +639,11 @@ pub fn radam_step_f16state(
     v_scale: f32,
     n: u32,
 ) {
-    let i = thread::index_1d();
-    if i.get() >= n as usize {
-        return;
-    }
-    let g_opt = grad.get_mut(i);
-    let m_opt = m.get_mut(i);
-    let v_opt = v.get_mut(i);
-    let w_opt = weights.get_mut(i);
-    if let (Some(g_ref), Some(m_ref), Some(v_ref), Some(w_ref)) = (g_opt, m_opt, v_opt, w_opt) {
-        let g = *g_ref;
-        let rate = lr * step_size;
-        let mut p = *w_ref;
-        p *= 1.0_f32 - decay * rate;
-        // f16 格納値を真値へ割り戻す (scale は power-of-2 なので除算は無誤差)。
-        let m_prev = (*m_ref as f32) / m_scale;
-        let v_prev = (*v_ref as f32) / v_scale;
-        let mi = beta1 * m_prev + (1.0_f32 - beta1) * g;
-        let vi = beta2 * v_prev + (1.0_f32 - beta2) * g * g;
-        // 格納: scale 後 f16 有限域に clamp してから半精度化。
-        let ms = mi * m_scale;
-        let ms_c = if ms > 65504.0_f32 {
-            65504.0_f32
-        } else if ms < -65504.0_f32 {
-            -65504.0_f32
-        } else {
-            ms
-        };
-        *m_ref = ms_c as f16;
-        let vs = vi * v_scale;
-        let vs_c = if vs > 65504.0_f32 { 65504.0_f32 } else { vs };
-        *v_ref = vs_c as f16;
-        // val は本 step の真値 mi / vi で計算する (f16 丸めは次 step の read で 1 回だけ入る)。
-        let mut val = mi;
-        if denom != 0 {
-            val /= vi.sqrt() + eps;
-        }
-        p -= rate * val;
-        let p_clamped = if p < min_w {
-            min_w
-        } else if p > max_w {
-            max_w
-        } else {
-            p
-        };
-        *w_ref = p_clamped;
-        *g_ref = 0.0_f32;
-    }
+    radam_step_body!(
+        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n;
+        f16, m_scale, v_scale;
+        keep_grad, no_mirror
+    );
 }
 
 /// [`radam_step_f16state`] に FP16 weight mirror 同時更新を足した variant
@@ -644,58 +672,11 @@ pub fn radam_step_f16state_mirror(
     v_scale: f32,
     n: u32,
 ) {
-    let i = thread::index_1d();
-    if i.get() >= n as usize {
-        return;
-    }
-    let g_opt = grad.get_mut(i);
-    let m_opt = m.get_mut(i);
-    let v_opt = v.get_mut(i);
-    let w_opt = weights.get_mut(i);
-    if let (Some(g_ref), Some(m_ref), Some(v_ref), Some(w_ref)) = (g_opt, m_opt, v_opt, w_opt) {
-        let g = *g_ref;
-        let rate = lr * step_size;
-        let mut p = *w_ref;
-        p *= 1.0_f32 - decay * rate;
-        let m_prev = (*m_ref as f32) / m_scale;
-        let v_prev = (*v_ref as f32) / v_scale;
-        let mi = beta1 * m_prev + (1.0_f32 - beta1) * g;
-        let vi = beta2 * v_prev + (1.0_f32 - beta2) * g * g;
-        let ms = mi * m_scale;
-        let ms_c = if ms > 65504.0_f32 {
-            65504.0_f32
-        } else if ms < -65504.0_f32 {
-            -65504.0_f32
-        } else {
-            ms
-        };
-        *m_ref = ms_c as f16;
-        let vs = vi * v_scale;
-        let vs_c = if vs > 65504.0_f32 { 65504.0_f32 } else { vs };
-        *v_ref = vs_c as f16;
-        let mut val = mi;
-        if denom != 0 {
-            val /= vi.sqrt() + eps;
-        }
-        p -= rate * val;
-        let p_clamped = if p < min_w {
-            min_w
-        } else if p > max_w {
-            max_w
-        } else {
-            p
-        };
-        *w_ref = p_clamped;
-        *g_ref = 0.0_f32;
-        // SAFETY: `mirror` は `weights` / `m` / `v` / `grad` と同要素数 `n` (caller が
-        // `ft_w` の要素数 `ft_w_n` を渡す)。kernel 冒頭で `i < n` を確認済みなので
-        // `mirror.add(i)` は in-bounds。各 thread は自分の `i` のみ書くため thread 間で
-        // aliasing は無い。`mirror` は他 buffer と別 alloc (caller 保証)。
-        let mirror_ptr = mirror.as_mut_ptr();
-        unsafe {
-            mirror_ptr.add(i.get()).write(p_clamped as f16);
-        }
-    }
+    radam_step_body!(
+        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n;
+        f16, m_scale, v_scale;
+        keep_grad, mirror, mirror
+    );
 }
 
 /// Ranger Lookahead lerp。
@@ -1134,8 +1115,10 @@ pub fn build_feature_counts(indices: &[i32], counts: &[u32], batch: u32, nnz: u3
     }
 }
 
-/// Phase 2 of inverse-index: exclusive prefix sum over `counts[0..n]` → `offsets[0..=n]`。
-/// 73K elements、1 block × 1024 threads で **並列** Hillis-Steele scan:
+/// Exclusive prefix sum over `counts[0..n]` → `offsets[0..=n]`、単一 block × 1024
+/// threads の **並列** Hillis-Steele scan (小 `n` 用)。inverse-index pipeline では
+/// multi-block scan の level 2 = block 総和列 (`num_blocks` ≲ 135 要素) の scan に使う
+/// (feature 数本体の分割は [`prefix_sum_block_local`] / [`prefix_sum_add_block_offset`])。
 /// 1. 各 thread が n/1024 個の chunk を直列和算 → shared PARTIALS[tid] (per-thread total)
 /// 2. block 内で PARTIALS の exclusive scan (sync_threads × log2(1024) = 10 round)
 /// 3. 各 thread が chunk_offset を起点に再走査して `offsets[j]` を書き出す
@@ -1216,6 +1199,105 @@ pub fn exclusive_prefix_sum_small(counts: &[u32], offsets: &[u32], n: u32) {
     }
 }
 
+/// Phase 2 of inverse-index, multi-block scan level 1: 各 block が `counts` の連続
+/// `blockDim` 要素 (`blockIdx*blockDim ..`) を block 内 exclusive scan し、**block 内
+/// local** な exclusive 値を `offsets` へ書く (block をまたぐ global offset は level 3
+/// `prefix_sum_add_block_offset` で加算)。block の総和を `block_sums[blockIdx]` へ emit。
+/// 単一 block scan ([`exclusive_prefix_sum_small`]) が 1 SM しか使えず大 `n` で律速に
+/// なるため、feature 数を block 群へ分割して全 SM を使う。
+///
+/// host: block_dim=(1024,1,1), grid_dim=(num_blocks,1,1)、num_blocks=ceil(n/1024)。
+#[kernel]
+pub fn prefix_sum_block_local(counts: &[u32], offsets: &[u32], block_sums: &[u32], n: u32) {
+    static mut PARTIALS: SharedArray<u32, 1024> = SharedArray::UNINIT;
+
+    let tid = thread::threadIdx_x() as usize;
+    let block_dim_u = thread::blockDim_x() as usize;
+    let blk = thread::blockIdx_x() as usize;
+    let idx = blk * block_dim_u + tid;
+    let n_u = n as usize;
+
+    // 範囲外 thread は 0 を寄与 (末尾 block の partial 対応)。
+    let val: u32 = if idx < n_u { counts[idx] } else { 0 };
+    unsafe {
+        PARTIALS[tid] = val;
+    }
+    thread::sync_threads();
+
+    // Hillis-Steele inclusive scan
+    let mut offset_step: usize = 1;
+    while offset_step < block_dim_u {
+        let add: u32 = if tid >= offset_step {
+            unsafe { PARTIALS[tid - offset_step] }
+        } else {
+            0
+        };
+        thread::sync_threads();
+        unsafe {
+            PARTIALS[tid] += add;
+        }
+        thread::sync_threads();
+        offset_step <<= 1;
+    }
+
+    // 自要素の block-local exclusive 値 (= 1 つ前の inclusive)。
+    let excl: u32 = if tid == 0 {
+        0
+    } else {
+        unsafe { PARTIALS[tid - 1] }
+    };
+    if idx < n_u {
+        let out_ptr = offsets.as_ptr() as *mut u32;
+        unsafe {
+            out_ptr.add(idx).write(excl);
+        }
+    }
+    // block 総和 = inclusive scan 最終値。tid=block_dim-1 が代表して書く。
+    if tid == block_dim_u - 1 {
+        let bs_ptr = block_sums.as_ptr() as *mut u32;
+        unsafe {
+            bs_ptr.add(blk).write(PARTIALS[block_dim_u - 1]);
+        }
+    }
+}
+
+/// Phase 2 of inverse-index, multi-block scan level 3: [`prefix_sum_block_local`] が
+/// 書いた block-local exclusive offsets に、level 2 で求めた `block_offsets[blockIdx]`
+/// (先行 block 群の総和) を in-place 加算し global exclusive prefix sum を確定する。
+/// `offsets[n]` (= 全総和 = `block_offsets[num_blocks]`) も 1 thread が書く。
+///
+/// host: block_dim=(1024,1,1), grid_dim=(num_blocks,1,1)。`block_offsets` は
+/// `block_sums` を [`exclusive_prefix_sum_small`] で scan した `num_blocks+1` 要素。
+#[kernel]
+pub fn prefix_sum_add_block_offset(
+    offsets: &[u32],
+    block_offsets: &[u32],
+    n: u32,
+    num_blocks: u32,
+) {
+    let tid = thread::threadIdx_x() as usize;
+    let block_dim_u = thread::blockDim_x() as usize;
+    let blk = thread::blockIdx_x() as usize;
+    let idx = blk * block_dim_u + tid;
+    let n_u = n as usize;
+
+    let add = block_offsets[blk];
+    if idx < n_u {
+        let out_ptr = offsets.as_ptr() as *mut u32;
+        unsafe {
+            let p = out_ptr.add(idx);
+            p.write(p.read() + add);
+        }
+    }
+    // 全総和を offsets[n] へ。block 0 の tid 0 が代表。
+    if blk == 0 && tid == 0 {
+        let out_ptr = offsets.as_ptr() as *mut u32;
+        unsafe {
+            out_ptr.add(n_u).write(block_offsets[num_blocks as usize]);
+        }
+    }
+}
+
 /// Phase 3 of inverse-index: 各 (b, slot) を inverse 順 (feature 別) に配置。
 /// `write_counters[f]` を atomic increment、`positions[offsets[f] + write_counters[f]] = bi`。
 /// host が呼出前に `write_counters` を 0 reset。
@@ -1253,7 +1335,8 @@ pub fn scatter_positions(
 ///
 /// block 構成: blockIdx_x = feature_id (`cols`)、blockIdx_y = ri tile (`ft_out / blockDim`)。
 /// block_dim threads (各 1 ri cell、cell 境界は block 内で disjoint なため atomic 不要)。
-/// 呼出 host は呼出前に grad_w を 0 reset (`memset_zero`)、書かなかった cell は 0 のまま。
+/// launch grid の全 `(feature, ri)` cell を必ず書く (`off_start == off_end` の feature でも
+/// sum=0 を書く) ため、caller は grad_w を事前 0-reset しなくてよい。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn gather_and_sum_per_feature_overwrite(
@@ -1575,60 +1658,6 @@ pub fn sparse_ft_backward(
                     as *const DeviceAtomicF32)
             };
             cell.fetch_add(g, AtomicOrdering::Relaxed);
-        }
-        ni += 1;
-    }
-}
-
-/// Fused stm+nstm sparse_ft_backward。2 回呼び出しを 1 kernel に統合し、kernel launch
-/// オーバーヘッドと per-thread setup を削減 (`bi` / `ri` / 計算は thread 共有)。
-/// per-thread の atomic add ops 数は変わらない (38 stm + 38 nstm = 76)。
-/// host が呼出前に `grad_weight` を 0 で初期化。
-#[allow(clippy::too_many_arguments)]
-#[kernel]
-pub fn sparse_ft_backward_dual(
-    grad_out_stm: &[f32],
-    grad_out_nstm: &[f32],
-    indices_stm: &[i32],
-    indices_nstm: &[i32],
-    grad_weight: &[f32],
-    batch: u32,
-    rows: u32,
-    cols: u32,
-    nnz: u32,
-) {
-    let tid = thread::index_1d();
-    let total = (batch as usize) * (rows as usize);
-    if tid.get() >= total {
-        return;
-    }
-    let bi = tid.get() / (rows as usize);
-    let ri = tid.get() % (rows as usize);
-    let rows_u = rows as usize;
-    let nnz_u = nnz as usize;
-    let cols_u = cols as usize;
-
-    let g_stm = grad_out_stm[tid.get()];
-    let g_nstm = grad_out_nstm[tid.get()];
-    let base = bi * nnz_u;
-
-    let mut ni: u32 = 0;
-    while ni < nnz {
-        let idx_s = indices_stm[base + (ni as usize)];
-        if idx_s >= 0 && (idx_s as usize) < cols_u {
-            let cell = unsafe {
-                &*(grad_weight.as_ptr().add((idx_s as usize) * rows_u + ri)
-                    as *const DeviceAtomicF32)
-            };
-            cell.fetch_add(g_stm, AtomicOrdering::Relaxed);
-        }
-        let idx_n = indices_nstm[base + (ni as usize)];
-        if idx_n >= 0 && (idx_n as usize) < cols_u {
-            let cell = unsafe {
-                &*(grad_weight.as_ptr().add((idx_n as usize) * rows_u + ri)
-                    as *const DeviceAtomicF32)
-            };
-            cell.fetch_add(g_nstm, AtomicOrdering::Relaxed);
         }
         ni += 1;
     }

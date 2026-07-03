@@ -1,12 +1,10 @@
 use std::path::Path;
 
-use cuda_host::cuda_launch;
-use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
+use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, cuda_launch};
 use nnue_format::{ArchKind, SimpleActivation, SimpleId, SimpleWeights};
-use nnue_train::dataloader::Batch;
 use nnue_train::init::{self, SimpleInit, WeightShape};
 use nnue_train::optimizer::radam_compute_step_size_denom;
-use nnue_train::trainer::{LossKind, TrainerBackend, ValidationStepOutput};
+use nnue_train::trainer::LossKind;
 
 use crate::*;
 use crate::{arch::*, ckpt::*, kernel_module::*, trainer_common::*};
@@ -39,10 +37,6 @@ pub(crate) struct SimpleGpuWorkspace {
     ft_stm_out: DeviceBuffer<f32>,
     /// 同 nstm。
     ft_nstm_out: DeviceBuffer<f32>,
-    /// stm bias add + 活性化後 (`b × ft_out`)、concat 元の tmp。
-    ft_stm_acted: DeviceBuffer<f32>,
-    /// 同 nstm。
-    ft_nstm_acted: DeviceBuffer<f32>,
     /// stm/nstm の FT post 出力を concat した L1 dense 入力 (`b × combined_dim`、
     /// CReLU/SCReLU は `2*ft_out`・Pairwise は `ft_out`)。
     combined: DeviceBuffer<f32>,
@@ -70,10 +64,6 @@ pub(crate) struct SimpleGpuWorkspace {
     dl1_pre: DeviceBuffer<f32>,
     /// concat 後 (`b × combined_dim`) への grad。L1 dense backward の入力 grad 先。
     dcombined: DeviceBuffer<f32>,
-    /// stm 活性化後への grad (`b × ft_out`)、concat 逆 (`slice_extract_2d`) の出力。
-    dft_stm_acted: DeviceBuffer<f32>,
-    /// 同 nstm。
-    dft_nstm_acted: DeviceBuffer<f32>,
     /// stm FT 出力 (= bias add 直後 / 活性化直前) への grad (`b × ft_out`)。
     /// `sparse_ft_backward` の入力 grad + `ft_b` bias grad の reduce 対象。
     dft_stm_out: DeviceBuffer<f32>,
@@ -94,16 +84,20 @@ pub(crate) struct SimpleGpuWorkspace {
     /// 同 nstm。
     dft_nstm_out_h: Option<DeviceBuffer<f16>>,
 
-    // -- inverse-index sparse_ft_backward scratch (`build_feature_counts` →
-    //    `exclusive_prefix_sum_small` → `scatter_positions` → `gather_and_sum_per_feature_*`
+    // -- inverse-index sparse_ft_backward scratch (`build_feature_counts` → exclusive
+    //    prefix sum (multi-block scan) → `scatter_positions` → `gather_and_sum_per_feature_*`
     //    pipeline 用)。per-feature gather で `dft_*_out` の DRAM read を 1 perspective につき
     //    各 (feature, ft_out) cell ちょうど 1 回に抑え、global atomic 数も `b * ft_out *
     //    max_active` から `b * max_active` (histogram + scatter) まで圧縮する。サイズは
     //    feature set ごとに固定 (`ft_in` / `max_active` で決まる)。
     /// per-feature 出現回数 histogram (`ft_in`、`build_feature_counts` で atomic build)。
     feat_counts: DeviceBuffer<u32>,
-    /// `feat_counts` の exclusive prefix sum (`ft_in + 1`、`exclusive_prefix_sum_small` で構築)。
+    /// `feat_counts` の exclusive prefix sum (`ft_in + 1`、multi-block scan で構築)。
     feat_offsets: DeviceBuffer<u32>,
+    /// multi-block scan level 1 の per-block 総和 (`ceil(ft_in/1024)`、`prefix_sum_block_local` が書く)。
+    feat_block_sums: DeviceBuffer<u32>,
+    /// `feat_block_sums` の exclusive prefix sum (`ceil(ft_in/1024)+1`、level 2 = `exclusive_prefix_sum_small`)。
+    feat_block_offsets: DeviceBuffer<u32>,
     /// `scatter_positions` 中の per-feature 書き込み位置カウンタ (`ft_in`、atomic incremented)。
     feat_write_ctr: DeviceBuffer<u32>,
     /// 各 feature 出現位置の sorted ストレージ (`batch * max_active`、`scatter_positions` が書く)。
@@ -157,8 +151,6 @@ impl SimpleGpuWorkspace {
             max_active,
             ft_stm_out: z(batch * ft_out)?,
             ft_nstm_out: z(batch * ft_out)?,
-            ft_stm_acted: z(batch * ft_out)?,
-            ft_nstm_acted: z(batch * ft_out)?,
             combined: z(batch * id.combined_dim())?,
             l1_pre: z(batch * l1_out)?,
             l1_acted: z(batch * l1_out)?,
@@ -171,8 +163,6 @@ impl SimpleGpuWorkspace {
             dl1_acted: z(batch * l1_out)?,
             dl1_pre: z(batch * l1_out)?,
             dcombined: z(batch * id.combined_dim())?,
-            dft_stm_acted: z(batch * ft_out)?,
-            dft_nstm_acted: z(batch * ft_out)?,
             dft_stm_out: z(batch * ft_out)?,
             dft_nstm_out: z(batch * ft_out)?,
             ft_stm_out_h: alloc_h(ft_fp16_out)?,
@@ -181,6 +171,8 @@ impl SimpleGpuWorkspace {
             dft_nstm_out_h: alloc_h(ft_fp16_out)?,
             feat_counts: DeviceBuffer::<u32>::zeroed(stream, ft_in)?,
             feat_offsets: DeviceBuffer::<u32>::zeroed(stream, ft_in + 1)?,
+            feat_block_sums: DeviceBuffer::<u32>::zeroed(stream, ft_in.div_ceil(1024))?,
+            feat_block_offsets: DeviceBuffer::<u32>::zeroed(stream, ft_in.div_ceil(1024) + 1)?,
             feat_write_ctr: DeviceBuffer::<u32>::zeroed(stream, ft_in)?,
             feat_positions: DeviceBuffer::<u32>::zeroed(stream, batch * max_active)?,
             stm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
@@ -228,6 +220,9 @@ impl SimpleGpuWorkspace {
 pub(crate) struct SimpleGpuTrainer {
     stream: std::sync::Arc<CudaStream>,
     module: std::sync::Arc<CudaModule>,
+    /// `dense_bias_grad_tiled` の grid 上限を実機 SM 数から導出するための occupancy
+    /// パラメータ (`new` で 1 度問い合わせ、特定 GPU 固定値を避ける)。
+    dense_bias_grad_occ: DeviceOccupancy,
     /// L1 dense (FP32) 用 cuBLAS handle (TF32 不使用、`CUBLAS_DEFAULT_MATH`)。
     /// stream に bind 済で同一 stream 内 in-order 実行。
     cublas: CublasHandle,
@@ -362,36 +357,37 @@ impl Drop for SimpleGpuTrainer {
 }
 
 impl SimpleGpuTrainer {
-    #[allow(clippy::too_many_arguments)]
+    /// 数値精度と optimizer state の形式は [`PrecisionFlags`] で指定する。
     pub(crate) fn new(
         ctx: &std::sync::Arc<CudaContext>,
         batch_size: usize,
         id: SimpleId,
         weight_decay: f32,
         fv_scale: i32,
-        ft_fp16: bool,
-        ft_fp16_out: bool,
-        fp16_opt_state: bool,
-        tf32: bool,
+        precision: PrecisionFlags,
         init_spec: &SimpleInit,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // `--ft-fp16-out` は weight FP16 path の拡張なので `--ft-fp16` を含意する。CLI
-        // 検証で reject 済だが、`SimpleGpuTrainer::new` を直接呼ぶ smoke / test 経路でも
-        // invariant を成立させる。
-        debug_assert!(!ft_fp16_out || ft_fp16, "ft_fp16_out requires ft_fp16");
+        // `precision.ft_fp16_out` は `precision.ft_fp16` を必要とする。CLI validation は
+        // 無効な組み合わせを拒否するが、smoke/test は constructor を直接呼べるため、ここでも検査する。
+        debug_assert!(
+            !precision.ft_fp16_out || precision.ft_fp16,
+            "ft_fp16_out requires ft_fp16"
+        );
         let stream = ctx.default_stream();
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
-        // `tf32` (CLI の `--tf32`) で cuBLAS math mode 切替。default OFF は
-        // `CUBLAS_DEFAULT_MATH` (純 FP32 path、L1/L2/L3 dense Sgemm bit-identical)。
-        // `true` で `CUBLAS_TF32_TENSOR_OP_MATH` を有効化し Ampere+ TC を使う (Sgemm 高速化、
-        // 仮数 23-bit → 10-bit 丸めで数値挙動が変わる、棋力 risk opt-in)。LayerStack
-        // `--tf32` と同方針。
-        let cublas = CublasHandle::new(&stream, tf32)?;
+        let dense_bias_grad_occ = DeviceOccupancy::query(ctx)?;
+        let cublas = CublasHandle::new(&stream, precision.tf32)?;
 
         let ft_in = id.ft_in();
         let ft_out = id.ft_out;
         let l1_out = id.l1_out;
         let l2_out = id.l2_out;
+        // ft_out == 0 は FT 出力が無い退化アーキ。`is_multiple_of(4)` は 0 を通すため
+        // 明示的に弾く。FT bias grad launch の grid.y = ceil(ft_out / min(ft_out, 1024)) が
+        // 0 除算 panic になるのも防ぐ (CLI 経由でなく new を直接呼ぶ test / smoke 経路の保険)。
+        if ft_out == 0 {
+            return Err("SimpleGpuTrainer: ft_out must be greater than 0".into());
+        }
         // sparse_ft_forward は 1 thread = 4 row なので ft_out が 4 の倍数必須。
         // Simple の preset (256/512/1024) は全部 4 の倍数だが、`--l1` override で
         // 4 の倍数でない値が来る可能性があるので early reject する。4 の倍数性は
@@ -470,8 +466,8 @@ impl SimpleGpuTrainer {
             l2_b_grad: z(l2_b_n)?,
             l3_w_grad: z(l3_w_n)?,
             l3_b_grad: z(l3_b_n)?,
-            ft_w_m: MomentBuf::zeroed(&stream, ft_w_n, fp16_opt_state)?,
-            ft_w_v: MomentBuf::zeroed(&stream, ft_w_n, fp16_opt_state)?,
+            ft_w_m: MomentBuf::zeroed(&stream, ft_w_n, precision.fp16_opt_state)?,
+            ft_w_v: MomentBuf::zeroed(&stream, ft_w_n, precision.fp16_opt_state)?,
             ft_w_slow,
             ft_b_m: z(ft_b_n)?,
             ft_b_v: z(ft_b_n)?,
@@ -494,28 +490,29 @@ impl SimpleGpuTrainer {
             l3_b_m: z(l3_b_n)?,
             l3_b_v: z(l3_b_n)?,
             l3_b_slow,
-            ws: SimpleGpuWorkspace::new(&stream, batch, id, ft_fp16_out)?,
+            ws: SimpleGpuWorkspace::new(&stream, batch, id, precision.ft_fp16_out)?,
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
             weight_sum_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
             fp16_clamp_counter: DeviceBuffer::<u64>::zeroed(&stream, 1)?,
             fp16_clamp_elems_written: 0,
             loss_ring: AsyncLossRing::new(ctx)?,
             input_ring: InputUploadRing::new_simple(ctx, batch, id.feature_set.max_active())?,
-            ft_w_h: if ft_fp16 {
+            ft_w_h: if precision.ft_fp16 {
                 Some(DeviceBuffer::<f16>::zeroed(&stream, ft_w_n)?)
             } else {
                 None
             },
             stream,
             module,
+            dense_bias_grad_occ,
             id,
             step_count: 0,
             weight_decay,
             fv_scale,
             cublas,
-            ft_fp16,
-            ft_fp16_out,
-            fp16_opt_state,
+            ft_fp16: precision.ft_fp16,
+            ft_fp16_out: precision.ft_fp16_out,
+            fp16_opt_state: precision.fp16_opt_state,
         })
     }
 
@@ -864,11 +861,21 @@ impl SimpleGpuTrainer {
 
         // -- FT post = bias add + 活性化 + concat。
         // `ft_fp16_out` 時は f16 `ft_*_out_h` を読む活性化別 kernel で `combined` を作る。
-        // CReLU / SCReLU は f32 `ft_*_acted` を経由して `slice_scatter_2d` で concat、
-        // Pairwise は `ft_post_perspective_fwd_fp16` が両 perspective まとめて `combined`
-        // を直書きする (slice_scatter 不要)。既定 (FP32) 経路は bias_add + 活性化 +
-        // slice_scatter を融合した kernel 群で合成する。
+        // CReLU / SCReLU / Pairwise いずれも活性化 kernel が `combined` の per-perspective
+        // 列範囲 (`col_offset`) へ直接書く (中間 `ft_*_acted` + `slice_scatter_2d` は融合で除去)。
+        // 既定 (FP32) 経路は bias_add + 活性化 + slice_scatter を融合した kernel 群で合成する。
         if self.ft_fp16_out {
+            // CReLU / SCReLU は nstm を `col_offset = ft_out` で combined に直書きするため
+            // `2*ft_out <= combined_dim` (= row stride) が成立しないと OOB write になる。
+            // CReLU/SCReLU は両 perspective 連結で combined_dim = 2*ft_out なので常に成立。
+            // Pairwise は combined_dim = ft_out で別 kernel を使うため対象外 (matches! で除外)。
+            debug_assert!(
+                !matches!(
+                    self.id.activation,
+                    SimpleActivation::CReLU | SimpleActivation::SCReLU
+                ) || 2 * ft_out_u32 <= l1_in_u32,
+                "fp16-out CReLU/SCReLU fwd needs 2*ft_out <= combined_dim (got 2*{ft_out_u32} vs {l1_in_u32})"
+            );
             match self.id.activation {
                 SimpleActivation::CReLU => {
                     let ft_stm_out_h = self
@@ -881,7 +888,7 @@ impl SimpleGpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
                             slice(ft_stm_out_h), slice(self.ft_b),
-                            slice_mut(self.ws.ft_stm_acted), b_u32, ft_out_u32
+                            slice_mut(self.ws.combined), l1_in_u32, 0_u32, b_u32, ft_out_u32
                         ]
                     }?;
                     let ft_nstm_out_h = self
@@ -894,7 +901,7 @@ impl SimpleGpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
                             slice(ft_nstm_out_h), slice(self.ft_b),
-                            slice_mut(self.ws.ft_nstm_acted), b_u32, ft_out_u32
+                            slice_mut(self.ws.combined), l1_in_u32, ft_out_u32, b_u32, ft_out_u32
                         ]
                     }?;
                 }
@@ -909,7 +916,7 @@ impl SimpleGpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
                             slice(ft_stm_out_h), slice(self.ft_b),
-                            slice_mut(self.ws.ft_stm_acted), b_u32, ft_out_u32
+                            slice_mut(self.ws.combined), l1_in_u32, 0_u32, b_u32, ft_out_u32
                         ]
                     }?;
                     let ft_nstm_out_h = self
@@ -922,7 +929,7 @@ impl SimpleGpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
                             slice(ft_nstm_out_h), slice(self.ft_b),
-                            slice_mut(self.ws.ft_nstm_acted), b_u32, ft_out_u32
+                            slice_mut(self.ws.combined), l1_in_u32, ft_out_u32, b_u32, ft_out_u32
                         ]
                     }?;
                 }
@@ -1022,34 +1029,6 @@ impl SimpleGpuTrainer {
             }
         }
 
-        // `ft_fp16_out` の CReLU / SCReLU 経路は活性化 kernel が `ft_*_acted` までしか
-        // 書かないため `combined` へ slice_scatter する。Pairwise + `ft_fp16_out` は
-        // `ft_post_perspective_fwd_fp16` が `combined` を直書き済なので skip。DEFAULT 経路は
-        // `simple_ft_post_fused_*` / `ft_post_perspective_fwd` が `combined` 直書きで同様に skip。
-        if self.ft_fp16_out && self.id.activation != SimpleActivation::Pairwise {
-            cuda_launch! {
-                kernel: slice_scatter_2d,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(ft_n),
-                args: [
-                    slice(self.ws.ft_stm_acted),
-                    slice_mut(self.ws.combined),
-                    b_u32, ft_out_u32, l1_in_u32, 0_u32
-                ]
-            }?;
-            cuda_launch! {
-                kernel: slice_scatter_2d,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(ft_n),
-                args: [
-                    slice(self.ws.ft_nstm_acted),
-                    slice_mut(self.ws.combined),
-                    b_u32, ft_out_u32, l1_in_u32, ft_out_u32
-                ]
-            }?;
-        }
         tick("fwd_ft_post", &self.stream, &mut prof_t0)?;
 
         // -- L1 dense (combined → l1_pre) cuBLAS Sgemm + bias_add_per_row --
@@ -1292,8 +1271,9 @@ impl SimpleGpuTrainer {
         let l2_n = b * self.id.l2_out;
         let l2_n_u32 = l2_n as u32;
 
-        // bias_grad は atomic add で累積するため host で 0 初期化必須。`ft_w_grad` は
-        // 後段の `gather_and_sum_per_feature_overwrite` (本関数末尾の inverse-index pipeline、
+        // bias grad kernel (`dense_bias_grad_tiled` / `simple_bias_grad_dual`) は atomic add で
+        // 累積するため host で 0 初期化必須。`ft_w_grad` は後段の
+        // `gather_and_sum_per_feature_overwrite` (本関数末尾の inverse-index pipeline、
         // iter 0 = stm) が全 `(feature, ri)` cell を書き切るため reset 不要。
         memset_zero(&self.stream, &self.ft_b_grad)?;
         memset_zero(&self.stream, &self.l1_b_grad)?;
@@ -1336,8 +1316,8 @@ impl SimpleGpuTrainer {
             )?;
         }
         cuda_launch! {
-            kernel: bias_grad, stream: self.stream, module: self.module,
-            config: cfg_1d(b),
+            kernel: dense_bias_grad_tiled, stream: self.stream, module: self.module,
+            config: cfg_dense_bias_grad(self.dense_bias_grad_occ, b_u32, 1),
             args: [slice(self.ws.dy_net_output), slice(self.l3_b_grad), b_u32, 1_u32]
         }?;
         tick("L3_dense", &self.stream, &mut prof_t0)?;
@@ -1394,11 +1374,22 @@ impl SimpleGpuTrainer {
                 self.l2_w_grad.cu_deviceptr() as *mut f32,
             )?;
         }
-        cuda_launch! {
-            kernel: bias_grad, stream: self.stream, module: self.module,
-            config: cfg_1d(l2_n),
-            args: [slice(self.ws.dl2_pre), slice(self.l2_b_grad), b_u32, l2_out_u32]
-        }?;
+        // `dense_bias_grad_tiled` の shared PARTIAL 容量 (block_dim <= 256) を超える out_dim
+        // (`--arch`/`--l3` で l2_out > 256 を指定した層) では任意幅で動く generic `bias_grad`
+        // に fall back する。常用 arch は l2_out <= 256 で tiled path を通る。
+        if l2_out_u32 <= DENSE_BIAS_GRAD_MAX_OUT {
+            cuda_launch! {
+                kernel: dense_bias_grad_tiled, stream: self.stream, module: self.module,
+                config: cfg_dense_bias_grad(self.dense_bias_grad_occ, b_u32, l2_out_u32),
+                args: [slice(self.ws.dl2_pre), slice(self.l2_b_grad), b_u32, l2_out_u32]
+            }?;
+        } else {
+            cuda_launch! {
+                kernel: bias_grad, stream: self.stream, module: self.module,
+                config: cfg_1d(l2_n),
+                args: [slice(self.ws.dl2_pre), slice(self.l2_b_grad), b_u32, l2_out_u32]
+            }?;
+        }
         tick("L2_dense", &self.stream, &mut prof_t0)?;
 
         // ---- L1 activation grad: dl1_acted -> dl1_pre (kernel reads l1_pre) ----
@@ -1453,36 +1444,45 @@ impl SimpleGpuTrainer {
                 self.l1_w_grad.cu_deviceptr() as *mut f32,
             )?;
         }
-        cuda_launch! {
-            kernel: bias_grad, stream: self.stream, module: self.module,
-            config: cfg_1d(l1_n),
-            args: [slice(self.ws.dl1_pre), slice(self.l1_b_grad), b_u32, l1_out_u32]
-        }?;
+        // l2_out と同じく out_dim > 256 では generic `bias_grad` に fall back する。
+        if l1_out_u32 <= DENSE_BIAS_GRAD_MAX_OUT {
+            cuda_launch! {
+                kernel: dense_bias_grad_tiled, stream: self.stream, module: self.module,
+                config: cfg_dense_bias_grad(self.dense_bias_grad_occ, b_u32, l1_out_u32),
+                args: [slice(self.ws.dl1_pre), slice(self.l1_b_grad), b_u32, l1_out_u32]
+            }?;
+        } else {
+            cuda_launch! {
+                kernel: bias_grad, stream: self.stream, module: self.module,
+                config: cfg_1d(l1_n),
+                args: [slice(self.ws.dl1_pre), slice(self.l1_b_grad), b_u32, l1_out_u32]
+            }?;
+        }
         tick("L1_dense", &self.stream, &mut prof_t0)?;
 
         // ---- Concat inverse + activation grad の融合 ----
-        // dcombined (b × combined_dim) の per-perspective 半分を `src_offset` で切り出して
-        // 読み、pre-activation `ft_*_out` で gate した値を `dft_*_out` に直接書く融合 kernel。
-        // 中間 `dft_*_acted` buffer の DRAM round-trip (b × ft_out × 4 byte の write+read) を
-        // 消す。`ft_fp16_out` 経路は f16 dft buffer + loss scaling + clamp + f16 cast を含む。
-        // CReLU / SCReLU は `slice_extract_2d` + `simple_act_grad_to_fp16_*_with_scale`、
-        // Pairwise は `ft_post_perspective_grad_fp16` (`dcombined` を直接 offset 読み)。
+        // dcombined (b × combined_dim) の per-perspective 半分を `col_offset` で直接 offset
+        // 読みし、pre-activation `ft_*_out` で gate した値を `dft_*_out` に書く融合 kernel。
+        // 中間 buffer への取り出し (`slice_extract_2d`) を介さず `dcombined` を直接 offset
+        // 読みすることで、b × ft_out × 4 byte の DRAM round-trip を消す。`ft_fp16_out`
+        // 経路は f16 dft buffer + loss scaling + clamp + f16 cast を含む。CReLU / SCReLU は
+        // `simple_act_grad_to_fp16_*_with_scale`、Pairwise は `ft_post_perspective_grad_fp16`
+        // がいずれも `dcombined` を `combined_stride` / `col_offset` で直接読む。
         if self.ft_fp16_out {
             let dft_scale = FT_DFT_FP16_BASE_SCALE * (b as f32);
+            // CReLU / SCReLU は nstm を `col_offset = ft_out` で dcombined から直接読むため
+            // `2*ft_out <= combined_dim` (= dcombined row stride) が成立しないと OOB read に
+            // なる。CReLU/SCReLU は両 perspective 連結で combined_dim = 2*ft_out なので常に成立。
+            // Pairwise は combined_dim = ft_out で別 kernel を使うため対象外 (matches! で除外)。
+            debug_assert!(
+                !matches!(
+                    self.id.activation,
+                    SimpleActivation::CReLU | SimpleActivation::SCReLU
+                ) || 2 * ft_out_u32 <= l1_in_u32,
+                "fp16-out CReLU/SCReLU grad needs 2*ft_out <= combined_dim (got 2*{ft_out_u32} vs {l1_in_u32})"
+            );
             match self.id.activation {
                 SimpleActivation::CReLU => {
-                    cuda_launch! {
-                        kernel: slice_extract_2d, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
-                        args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_stm_acted),
-                               b_u32, l1_in_u32, 0_u32, ft_out_u32]
-                    }?;
-                    cuda_launch! {
-                        kernel: slice_extract_2d, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
-                        args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_nstm_acted),
-                               b_u32, l1_in_u32, ft_out_u32, ft_out_u32]
-                    }?;
                     let ft_stm_out_h = self
                         .ws
                         .ft_stm_out_h
@@ -1498,7 +1498,7 @@ impl SimpleGpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
                             slice(ft_stm_out_h), slice(self.ft_b),
-                            slice(self.ws.dft_stm_acted), slice_mut(dft_stm_out_h),
+                            slice(self.ws.dcombined), l1_in_u32, 0_u32, slice_mut(dft_stm_out_h),
                             slice(self.fp16_clamp_counter),
                             b_u32, ft_out_u32, dft_scale
                         ]
@@ -1518,7 +1518,7 @@ impl SimpleGpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
                             slice(ft_nstm_out_h), slice(self.ft_b),
-                            slice(self.ws.dft_nstm_acted), slice_mut(dft_nstm_out_h),
+                            slice(self.ws.dcombined), l1_in_u32, ft_out_u32, slice_mut(dft_nstm_out_h),
                             slice(self.fp16_clamp_counter),
                             b_u32, ft_out_u32, dft_scale
                         ]
@@ -1530,18 +1530,6 @@ impl SimpleGpuTrainer {
                         .saturating_add(2_u64 * ft_n as u64);
                 }
                 SimpleActivation::SCReLU => {
-                    cuda_launch! {
-                        kernel: slice_extract_2d, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
-                        args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_stm_acted),
-                               b_u32, l1_in_u32, 0_u32, ft_out_u32]
-                    }?;
-                    cuda_launch! {
-                        kernel: slice_extract_2d, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
-                        args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_nstm_acted),
-                               b_u32, l1_in_u32, ft_out_u32, ft_out_u32]
-                    }?;
                     let ft_stm_out_h = self
                         .ws
                         .ft_stm_out_h
@@ -1557,7 +1545,7 @@ impl SimpleGpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
                             slice(ft_stm_out_h), slice(self.ft_b),
-                            slice(self.ws.dft_stm_acted), slice_mut(dft_stm_out_h),
+                            slice(self.ws.dcombined), l1_in_u32, 0_u32, slice_mut(dft_stm_out_h),
                             slice(self.fp16_clamp_counter),
                             b_u32, ft_out_u32, dft_scale
                         ]
@@ -1577,7 +1565,7 @@ impl SimpleGpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
                             slice(ft_nstm_out_h), slice(self.ft_b),
-                            slice(self.ws.dft_nstm_acted), slice_mut(dft_nstm_out_h),
+                            slice(self.ws.dcombined), l1_in_u32, ft_out_u32, slice_mut(dft_nstm_out_h),
                             slice(self.fp16_clamp_counter),
                             b_u32, ft_out_u32, dft_scale
                         ]
@@ -1706,12 +1694,20 @@ impl SimpleGpuTrainer {
         } else {
             1.0_f32 // unused on FP32 path
         };
-        // FT bias grad: CReLU / SCReLU は per-cell に stm + nstm のローカル和を作って
-        // atomic add 1 回で `ft_b_grad[oi]` に accumulate する (`simple_bias_grad_dual`、
-        // atomic contention は B * ft_dim 回で stm/nstm 別 launch の半分)。Pairwise は
-        // `ft_post_perspective_grad[_fp16]` が `dft_*_out` 書き込みと同 pass で同値を
-        // `ft_b_grad` へ accumulate 済 (FT bias grad = pre-activation 勾配 dft の batch 和)
-        // のため、別 launch しない。
+        // FT bias grad: per-output tile reduction。thread `oi` が出力 oi を専有し、自 block の
+        // `items` positions を register 累積してから `ft_b_grad[oi]` へ atomic 1 回
+        // (`simple_bias_grad_dual[_fp16]`)。global atomic contention は ceil(B/items) * ft_dim で、
+        // 1 thread 1 cell が直接 atomic add する素朴版 (B * ft_dim) より少ない。Pairwise は
+        // `ft_post_perspective_grad[_fp16]` が
+        // `dft_*_out` 書き込みと同 pass で同値を `ft_b_grad` へ accumulate 済 (FT bias grad =
+        // pre-activation 勾配 dft の batch 和) のため、別 launch しない。
+        // `block_dim = min(ft_out, 1024)`・`grid.y = ceil(ft_out / block_dim)` の 2D grid で
+        // thread→output を対応付ける (grid.x = position tile、grid.y = output tile)。output を y
+        // タイルに割るので ft_out が CUDA の block 上限 1024 を超えても起動できる。
+        let bias_grad_items = 64_u32;
+        let bias_grad_blocks = b_u32.div_ceil(bias_grad_items);
+        let bias_grad_block_dim = ft_out_u32.min(1024);
+        let bias_grad_out_tiles = ft_out_u32.div_ceil(bias_grad_block_dim);
         match self.id.activation {
             SimpleActivation::Pairwise => {}
             SimpleActivation::CReLU | SimpleActivation::SCReLU => {
@@ -1728,23 +1724,31 @@ impl SimpleGpuTrainer {
                         .expect("dft_nstm_out_h is Some when ft_fp16_out is enabled");
                     cuda_launch! {
                         kernel: simple_bias_grad_dual_fp16, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
+                        config: LaunchConfig {
+                            grid_dim: (bias_grad_blocks, bias_grad_out_tiles, 1),
+                            block_dim: (bias_grad_block_dim, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
                         args: [
                             slice(dft_stm_out_h),
                             slice(dft_nstm_out_h),
                             slice(self.ft_b_grad),
-                            b_u32, ft_out_u32, dft_inv_scale_fp16
+                            b_u32, ft_out_u32, dft_inv_scale_fp16, bias_grad_items
                         ]
                     }?;
                 } else {
                     cuda_launch! {
                         kernel: simple_bias_grad_dual, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
+                        config: LaunchConfig {
+                            grid_dim: (bias_grad_blocks, bias_grad_out_tiles, 1),
+                            block_dim: (bias_grad_block_dim, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
                         args: [
                             slice(self.ws.dft_stm_out),
                             slice(self.ws.dft_nstm_out),
                             slice(self.ft_b_grad),
-                            b_u32, ft_out_u32
+                            b_u32, ft_out_u32, bias_grad_items
                         ]
                     }?;
                 }
@@ -1752,8 +1756,8 @@ impl SimpleGpuTrainer {
         }
 
         // FT weight grad — **inverse-index pipeline** で per-feature gather に変換する経路。
-        // 各 perspective につき (A) `build_feature_counts` で histogram、(B)
-        // `exclusive_prefix_sum_small` で offset、(C) `scatter_positions` で sorted position 列を
+        // 各 perspective につき (A) `build_feature_counts` で histogram、(B) multi-block
+        // exclusive prefix sum で offset、(C) `scatter_positions` で sorted position 列を
         // 構築し、(D) `gather_and_sum_per_feature_overwrite` (1 回目 = stm) /
         // `gather_and_sum_per_feature_add` (2 回目 = nstm) が `(feature, ri)` cell ごとに
         // sum を書く。FP16 path は同 pipeline で `_fp16` 変種に dft_inv_scale を渡す。
@@ -1782,7 +1786,26 @@ impl SimpleGpuTrainer {
                     b_u32, max_active_u32, ft_in_u32
                 ]
             }?;
-            // B: exclusive prefix sum (1 block × 1024 threads、`ft_in` ~73K-138K に対応)。
+            // B: feat_counts の exclusive prefix sum (multi-block scan で全 SM を使う)。
+            // 単一 block scan は 1 SM 律速 (`ft_in` ~73K-138K で大半 idle) のため 3 段に分割。
+            let prefix_blocks = ft_in_u32.div_ceil(1024);
+            // level 1: 各 block が連続 1024 要素を block-local scan、block 総和を emit。
+            cuda_launch! {
+                kernel: prefix_sum_block_local,
+                stream: self.stream, module: self.module,
+                config: LaunchConfig {
+                    grid_dim: (prefix_blocks, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [
+                    slice(self.ws.feat_counts),
+                    slice(self.ws.feat_offsets),
+                    slice(self.ws.feat_block_sums),
+                    ft_in_u32
+                ]
+            }?;
+            // level 2: block 総和列 (prefix_blocks ≲ 135 要素) を単一 block で scan。
             cuda_launch! {
                 kernel: exclusive_prefix_sum_small,
                 stream: self.stream, module: self.module,
@@ -1792,9 +1815,25 @@ impl SimpleGpuTrainer {
                     shared_mem_bytes: 0,
                 },
                 args: [
-                    slice(self.ws.feat_counts),
+                    slice(self.ws.feat_block_sums),
+                    slice(self.ws.feat_block_offsets),
+                    prefix_blocks
+                ]
+            }?;
+            // level 3: block-local offsets へ block offset を加算 + offsets[n]=total。
+            cuda_launch! {
+                kernel: prefix_sum_add_block_offset,
+                stream: self.stream, module: self.module,
+                config: LaunchConfig {
+                    grid_dim: (prefix_blocks, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [
                     slice(self.ws.feat_offsets),
-                    ft_in_u32
+                    slice(self.ws.feat_block_offsets),
+                    ft_in_u32,
+                    prefix_blocks
                 ]
             }?;
             // C: 各 (b, ni) sparse index について feat_positions の per-feature slot に
@@ -2407,103 +2446,14 @@ impl SimpleGpuTrainer {
     }
 }
 
-impl TrainerBackend for SimpleGpuTrainer {
-    fn train_step(
-        &mut self,
-        batch: &Batch,
-        bucket_idx: &[i32],
-        lr: f32,
-        wdl_lambda: f32,
-        loss: LossKind,
-    ) -> std::io::Result<f64> {
-        if batch.feature_set != self.id.feature_set {
-            return Err(std::io::Error::other(format!(
-                "batch feature set '{}' does not match trainer feature set '{}'",
-                batch.feature_set.canonical_name(),
-                self.id.feature_set.canonical_name(),
-            )));
-        }
-        // Simple は bucket を持たないため `bucket_idx` を kernel に渡さない (caller の
-        // `TrainerBackend` 契約上は受け取るが、`from_batch_ref_bucketless` で空 slice 化
-        // して下流 backend が `bucket_idx` に触れない経路を強制する)。
-        let _ = bucket_idx;
-        let data = BatchData::from_batch_ref_bucketless(batch);
-        self.step(&data, lr, wdl_lambda, loss)
-            .map_err(|e| std::io::Error::other(format!("SimpleGpuTrainer::step failed: {e}")))
-    }
-
-    fn validate_step(
-        &mut self,
-        batch: &Batch,
-        bucket_idx: &[i32],
-        wdl_lambda: f32,
-        loss: LossKind,
-    ) -> std::io::Result<ValidationStepOutput> {
-        if batch.feature_set != self.id.feature_set {
-            return Err(std::io::Error::other(format!(
-                "batch feature set '{}' does not match trainer feature set '{}'",
-                batch.feature_set.canonical_name(),
-                self.id.feature_set.canonical_name(),
-            )));
-        }
-        let _ = bucket_idx;
-        let data = BatchData::from_batch_ref_bucketless(batch);
-        let out = self.validate(&data, wdl_lambda, loss).map_err(|e| {
-            std::io::Error::other(format!("SimpleGpuTrainer::validate failed: {e}"))
-        })?;
-        Ok(ValidationStepOutput {
-            sum_sq_err: out.loss,
-            net_output: out.net_output,
-        })
-    }
-
-    fn flush_pending_loss(&mut self) -> std::io::Result<f64> {
-        self.loss_ring.flush_pending_loss().map_err(|e| {
-            std::io::Error::other(format!(
-                "SimpleGpuTrainer::loss_ring.flush_pending_loss failed: {e}"
-            ))
-        })
-    }
-
-    fn save_checkpoint(&mut self, path: &Path) -> std::io::Result<()> {
-        let weights = self.to_simple_weights().map_err(|e| {
-            std::io::Error::other(format!("SimpleGpuTrainer::to_simple_weights failed: {e}"))
-        })?;
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
-        weights.save_quantised(&mut writer)?;
-        use std::io::Write;
-        writer.flush()?;
-        Ok(())
-    }
-
-    fn save_resume_checkpoint(
-        &mut self,
-        path: &Path,
-        superbatch: usize,
-        run_id: &str,
-        lr_horizon: Option<usize>,
-    ) -> std::io::Result<()> {
-        self.save_raw_checkpoint(path, superbatch, run_id, lr_horizon)
-            .map_err(|e| match e.downcast::<std::io::Error>() {
-                Ok(io_err) => *io_err,
-                Err(other) => std::io::Error::other(format!(
-                    "SimpleGpuTrainer::save_raw_checkpoint failed: {other}"
-                )),
-            })
-    }
-
-    fn read_fp16_clamp_count(&mut self) -> std::io::Result<(u64, u64)> {
-        // `to_host_vec` 内部で `stream.synchronize` する。cumulative counter の sb 末
-        // 報告は同期 path で十分。
-        let host = self
-            .fp16_clamp_counter
-            .to_host_vec(&self.stream)
-            .map_err(|e| std::io::Error::other(format!("clamp counter D2H failed: {e}")))?;
-        Ok((host[0], self.fp16_clamp_elems_written))
-    }
+trainer_backend_impl! {
+    trainer: SimpleGpuTrainer,
+    feature_set: id.feature_set,
+    batch: bucketless,
+    weights: to_simple_weights,
+    step_error: "SimpleGpuTrainer::step failed: {}",
+    validate_error: "SimpleGpuTrainer::validate failed: {}",
+    flush_error: "SimpleGpuTrainer::loss_ring.flush_pending_loss failed: {}",
+    weights_error: "SimpleGpuTrainer::to_simple_weights failed: {}",
+    resume_error: "SimpleGpuTrainer::save_raw_checkpoint failed: {}",
 }
