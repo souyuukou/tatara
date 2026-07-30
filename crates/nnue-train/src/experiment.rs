@@ -38,10 +38,8 @@ use serde::Serialize;
 /// history schema 拡張が要る (ADR `2026-05-17-experiment-json.md` 参照)。
 pub const SCHEMA_VERSION: u32 = 2;
 
-/// LayerStack の量子化 `fv_scale` (`nnue_format::layerstack_weights::FV_SCALE` と
-/// 同値)。`results.fv_scale` に記録する。`nnue-train` crate は `nnue-format` に
-/// 本体依存しないため定数を持ち直す (同値性は dev-dependency 経由のテストで固定)。
-const FV_SCALE: i32 = 28;
+// `results.fv_scale` はアーキと loss により異なるため、呼び出し側が実際に export
+// する値を渡す。LayerStack の arch string で省略する場合は JSON でも省略する。
 
 // =============================================================================
 // serialise 対象の本体
@@ -92,6 +90,10 @@ pub struct Params {
     /// 無効の run では省略 (factorizer 以前の run の JSON と同形)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ft_factorize: Option<bool>,
+    /// Enables shared-delta parameterization for LayerStack L2/L3. L1 already
+    /// has a shared term in the base architecture and is therefore not represented here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stack_shared_delta: Option<bool>,
     /// FT 出力次元 (per-perspective)。入力次元ではない点に注意。
     pub l0: usize,
     pub l1: usize,
@@ -136,7 +138,7 @@ pub struct Params {
     /// lr_mult。per-group override flag を一つでも指定した run でのみ 6 値すべてを
     /// `Some` で記録し、全未指定の既定 run では省略する (大域 `weight_decay` と
     /// lr_mult=1.0 が全 group に適用され、`weight_decay` フィールドで足りるため)。
-    /// `ft` は `ft_w` / `psqt_w`、`dense` は L1/L1f/L2/L3 weight、`bias` は全 bias。
+    /// `ft` は `ft_w` / `psqt_w`、`dense` は L1/L1 shared/L2/L3 weight、`bias` は全 bias。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ft_weight_decay: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -182,15 +184,18 @@ pub struct Params {
     /// `|score| >= score_drop_abs` の局面を loss から除外する閾値。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_drop_abs: Option<i32>,
+    /// drop を生き残った局面の score を `[-c, c]` に飽和させる閾値。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_clamp_abs: Option<i32>,
     /// `--init-from` の入力ファイル basename (pretrained start)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_from: Option<String>,
-    /// 重み初期化の override 要約 (`--init-{ft,l1,l1f,l2,l3}` で差し替えた層名)。
+    /// 重み初期化の override 要約 (`--init-{ft,l1,l1-shared,l2,l3}` で差し替えた層名)。
     /// override の無い既定の run では省略する。field 名は experiment.json schema
     /// 互換のため従来どおり `init_preset`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_preset: Option<String>,
-    /// held-out validation 用 PSV ファイルの basename (`--test-data`)。未指定なら省略。
+    /// held-out validation 用ファイルの basename (`--test-data`)。未指定なら省略。
     /// `--test-tail-positions` 経路では同 file (= training PSV) の末尾を holdout
     /// にするためここではなく `test_tail_positions` 側に N が入る。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -233,7 +238,7 @@ pub struct DataInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct Results {
     pub training_time_seconds: u64,
-    pub fv_scale: i32,
+    pub fv_scale: Option<i32>,
     /// 最小 loss と、それを記録した superbatch。1 点も記録されていなければ省略。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub best_loss: Option<f64>,
@@ -305,6 +310,10 @@ impl ExperimentDoc {
     /// run 開始時点の `ExperimentDoc` を組み立てる (`status = "running"`、
     /// `history` 空、`results` は 0 埋め)。`date` / `last_updated_at` は
     /// `start_epoch_secs` から導出する。
+    ///
+    /// `fv_scale` は **実際に export される NNUE の値**を渡すこと。experiment.json は
+    /// 公開の実験トラッカーに投入され、利用者はこの値をエンジンの `FV_SCALE` に設定する
+    /// ため、`.bin` の arch string と食い違うと誤った評価スケールで対局させることになる。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
@@ -315,6 +324,7 @@ impl ExperimentDoc {
         lineage: Option<Lineage>,
         params: Params,
         data: DataInfo,
+        fv_scale: Option<i32>,
     ) -> Self {
         let date = format_utc_iso(start_epoch_secs);
         Self {
@@ -332,7 +342,7 @@ impl ExperimentDoc {
             data,
             results: Results {
                 training_time_seconds: 0,
-                fv_scale: FV_SCALE,
+                fv_scale,
                 best_loss: None,
                 best_loss_superbatch: None,
                 best_test_loss: None,
@@ -568,11 +578,36 @@ fn civil_from_epoch(epoch_secs: u64) -> (i64, u32, u32, u32, u32, u32) {
 mod tests {
     use super::*;
 
-    /// 持ち直した定数 (定義箇所の doc 参照) が `nnue-format` 側と乖離すると
-    /// experiment.json が誤った `fv_scale` を記録するため、同値性を固定する。
+    /// `results.fv_scale` は呼び出し側が渡した値をそのまま記録する。固定値に戻すと
+    /// simple (scale から導出) で `.bin` と食い違うため、素通しであることを守る。
     #[test]
-    fn fv_scale_matches_nnue_format() {
-        assert_eq!(FV_SCALE, nnue_format::layerstack_weights::FV_SCALE);
+    fn fv_scale_is_taken_from_caller() {
+        let doc = sample_doc();
+        assert_eq!(
+            doc.results.fv_scale,
+            Some(nnue_format::layerstack_weights::FV_SCALE)
+        );
+
+        let simple_fv_scale = nnue_format::simple_weights::simple_fv_scale(600.0);
+        assert_ne!(simple_fv_scale, nnue_format::layerstack_weights::FV_SCALE);
+        let doc = ExperimentDoc::new(
+            "exp".to_string(),
+            "exp".to_string(),
+            1_747_000_000,
+            None,
+            "nnue-train".to_string(),
+            None,
+            sample_params(),
+            sample_data(),
+            Some(simple_fv_scale),
+        );
+        assert_eq!(doc.results.fv_scale, Some(simple_fv_scale));
+
+        let mut doc = sample_doc();
+        doc.results.fv_scale = None;
+        let results = serde_json::to_value(&doc.results).expect("serialise results");
+        assert!(results.get("fv_scale").is_some());
+        assert!(results["fv_scale"].is_null());
     }
 
     fn sample_params() -> Params {
@@ -581,6 +616,7 @@ mod tests {
             feature_set: "halfka-hm-merged".to_string(),
             ft_in: 73_305,
             ft_factorize: None,
+            stack_shared_delta: None,
             l0: 1536,
             l1: 16,
             l2: 32,
@@ -622,6 +658,7 @@ mod tests {
             wrm_weight_boost_w1: Some(0.0),
             wrm_weight_boost_w2: Some(0.5),
             score_drop_abs: None,
+            score_clamp_abs: None,
             init_from: None,
             init_preset: None,
             test_data: None,
@@ -654,6 +691,7 @@ mod tests {
             None,
             sample_params(),
             sample_data(),
+            Some(nnue_format::layerstack_weights::FV_SCALE),
         )
     }
 
@@ -797,6 +835,7 @@ mod tests {
             None,
             params,
             sample_data(),
+            Some(nnue_format::layerstack_weights::FV_SCALE),
         );
         let v = serde_json::to_value(&doc).expect("serialise");
         assert!(v.get("commit").is_none());
@@ -823,6 +862,7 @@ mod tests {
             None,
             params,
             sample_data(),
+            Some(nnue_format::layerstack_weights::FV_SCALE),
         );
         let v = serde_json::to_value(&doc).expect("serialise");
         assert_eq!(v["params"]["start_wdl"], 0.0);

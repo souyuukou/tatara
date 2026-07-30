@@ -4,14 +4,14 @@
 
 ## Context
 
-HalfKP / HalfKA 系 feature set の FT 重みは (king bucket × piece plane) の疎
+HalfKP / HalfKA 系 feature set の FT 重みは (king bucket × piece-input ordinal) の疎
 テーブルで、実戦の玉位置が囲いに偏在するためセルの大半は勾配がほとんど
 届かず初期値近傍に留まる。nnue-pytorch は学習時のみ仮想特徴 (king bucket
-非依存の piece plane) を追加し、export 時に実重みへ畳み込む factorizer で
-この偏りを補っている。本リポの LayerStack は L1 に同型の機構 (`l1f` shared
+非依存の piece-input ordinal) を追加し、export 時に実重みへ畳み込む factorizer で
+この偏りを補っている。本リポの LayerStack は L1 に同型の機構 (`l1_shared` shared
 + per-bucket delta) を持つが、FT には無かった。
 
-仮想 P plane の行は king bucket を問わず全局面から勾配を受ける (実効データ
+piece-input 仮想行 の行は king bucket を問わず全局面から勾配を受ける (実効データ
 ~king-bucket 数倍) ため、玉非依存の成分を高速に学習し、レア玉位置のセルは
 export 時に共有 prior を継承する。export で畳み込むため出力 artifact
 (次元 / hash / arch 文字列) は base と同一で、推論エンジン側の変更はない。
@@ -29,7 +29,7 @@ factorizer を本番 ON にしている (`model/features/__init__.py` の
 `--ft-factorize` は back-compat の明示 ON (既定と冗長)、`--no-ft-factorize` が
 opt-out。`overrides_with` で command-line 後勝ち。
 
-- **`--psqt` 併用**: **併用可**。PSQT shortcut も FT と同じ仮想 P 行を持ち、
+- **`--psqt` 併用**: **併用可**。PSQT shortcut も FT と同じpiece-input 仮想行を持ち、
   forward は畳み込み済み comb (`PsqtState::w_fold`、base 形状)、backward は
   実 grad の king-bucket 方向縮約で仮想 grad を埋める。FT の fold/reduce kernel
   (`ft_fold_virtual` / `ft_reduce_virtual_grad`) と export の
@@ -101,7 +101,7 @@ raw checkpoint header の feature-set 節に factorizer flag を追加する
 ### 5. export は量子化・飽和検査の前に畳み込む
 
 `W_real[(kb, p)] += W_virtual[p]` の畳み込みを base 形状の host buffer 構築
-として先に行い、その配列に i16 飽和検査 → 量子化を掛ける (`l1f` merge と
+として先に行い、その配列に i16 飽和検査 → 量子化を掛ける (`l1_shared` merge と
 同型の操作)。畳み込み後の weight 表現は spec も base に落とす — 出力物が
 plain な base net であることを型で表す。
 
@@ -125,7 +125,7 @@ norm の apply は group 内一律乗算なので畳み込みと可換、zero �
 ### 8. FP16 optimizer state の scale headroom
 
 `--fp16-opt-state` の固定 scale (m: 2^28 / v: 2^40) は実 row の実測に基づく。
-仮想 P 行は同一 p を持つ全実 row の勾配和を受ける (最大 ~king-bucket 数倍、
+piece-input 仮想行は同一 p を持つ全実 row の勾配和を受ける (最大 ~king-bucket 数倍、
 v は二乗オーダー) ため、headroom を超えると f16 格納時の silent clamp で
 仮想行の実効 step が静かに歪むリスクがある。運用では本番 run の前に
 `--fp16-opt-state` 抜きの短い run で仮想 block の |m| / |v| 上限を実測して

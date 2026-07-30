@@ -9,8 +9,8 @@
 //!   依存、ft_out は `--ft-out`)
 //! - per-perspective post: bias add → CReLU → pairwise_mul (ft_out → ft_out/2) → ×127/128
 //! - combined = stm.concat(nstm) = ft_out
-//! - L1 (per-bucket delta + shared l1f factorized): `num_buckets` × l1_out + (ft_out, l1_out)
-//! - l1_total = L1.select(bucket) + L1f、main (l1_out - 1) + skip (1) に slice
+//! - L1 (per-bucket term + L1 shared term): `num_buckets` × l1_out + (ft_out, l1_out)
+//! - l1_total = L1.select(bucket) + L1 shared、main (l1_out - 1) + skip (1) に slice
 //! - L2 (per-bucket): `num_buckets` × l2_out with input l2_in = (l1_out - 1) * 2
 //! - L3 (per-bucket output): `num_buckets` × 1
 //! - PSQT shortcut (任意): `(ft_in, num_buckets)` の per-feature × per-bucket スカラー。
@@ -30,13 +30,13 @@
 //!    feat 内 bucket 連番)。scale は `QA * QB = 8128` (bias は 0 固定)。
 //! 7. layerstacks: `num_buckets` × {fc_hash (4 LE u32), L1 (bias + weight), L2 (同), L3 (同)}
 //!
-//! ## save 時の L1 / L1f coalesce
+//! ## save 時の L1 / L1 shared coalesce
 //!
-//! per-bucket l1 と shared l1f を **save 時に merge** して per-bucket の単一
+//! per-bucket L1 と L1 shared term を **save 時に merge** して per-bucket の単一
 //! weight として書き出す:
 //!
-//! - `l1_bias_merged[bucket][out] = l1_b[bucket][out] + l1f_b[out]` (bias broadcast)
-//! - `l1_weight_merged[bucket][out][in] = l1_w[bucket][out][in] + l1f_w[in][out]` (in/out 軸入替注意)
+//! - `l1_bias_merged[bucket][out] = l1_b[bucket][out] + l1_shared_bias[out]` (bias broadcast)
+//! - `l1_weight_merged[bucket][out][in] = l1_w[bucket][out][in] + l1_shared_weight[in][out]` (in/out 軸入替注意)
 //!
 //! 推論エンジン rshogi は `Factorizer` を含む arch を reject する (coalesced only を要求)
 //! ため、save 時に必ず merge する不変条件。
@@ -69,7 +69,7 @@
 
 use std::io::{self, Read, Write};
 
-use shogi_features::FeatureSetSpec;
+use shogi_features::{EffectBucketConfig, FeatureSetSpec, FtFactorizeMode};
 
 // =============================================================================
 // constants (LayerStack architecture)
@@ -101,8 +101,7 @@ pub const QA: i32 = 127;
 pub const QB: i32 = 64;
 pub const FV_SCALE: i32 = 28;
 
-/// `(127.0 / 290.0) * 28 == 12.262...` の denominator。
-/// 推論エンジン側は arch_str から `fv_scale=28` を読み、本 SCALE と組み合わせる。
+/// plain sigmoid-MSE の既定 score scale。
 pub const SCALE: u32 = 290;
 
 /// pad to multiple of 32 (SIMD alignment)。
@@ -242,7 +241,7 @@ fn decode_single_leb128(data: &[u8]) -> io::Result<(i64, usize)> {
 ///  SqrClippedReLU[<l2_in>](
 ///  AffineTransform[<l1_out>-<ft_out_x2>](
 ///  InputSlice[<ft_out_x2>(0:<ft_out_x2>)]))))),
-///  fv_scale=<fv_scale>`
+///  [,fv_scale=<fv_scale>]`
 ///
 /// (実際は 1 行連結、ここでは可読性のため改行)
 ///
@@ -257,11 +256,37 @@ pub fn features_token(feature_name: &str, input_size: usize, ft_out: usize) -> S
 
 /// arch_str / stream に書く threat profile identity (rshogi 契約)。`dims` はその
 /// profile の THREAT_DIMENSIONS、`profile_id` は profile の数値 id (full=0 /
-/// same-class=1 / same-class-major-pawn=2 / step-attacker=3 / cross-side=10)。
+/// same-class=1 / same-class-major-pawn=2 / step-attacker=3 / full-symdedup=4 /
+/// cross-side=10)。full-symdedup は dims が full と同一 (216_720) なので profile
+/// の判別は id token のみが担う。
 #[derive(Clone, Copy, Debug)]
 pub struct ThreatArch {
     pub dims: usize,
     pub profile_id: u32,
+}
+
+/// arch_str / stream に書く effect bucket identity。`nb` は bucket 数、`king_bucketed`
+/// は玉 feature も bucket 化するかを表す。
+#[derive(Clone, Copy, Debug)]
+pub struct EffectBucketArch {
+    pub nb: usize,
+    pub king_bucketed: bool,
+}
+
+impl EffectBucketArch {
+    fn token_value(self) -> String {
+        let king = if self.king_bucketed {
+            "bucketed"
+        } else {
+            "fixed"
+        };
+        let axes = match self.nb {
+            4 => "2x2",
+            9 => "3x3",
+            _ => panic!("unsupported EffectBucket bucket count: {}", self.nb),
+        };
+        format!("{axes}{king}")
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -272,9 +297,10 @@ pub fn build_arch_str(
     l1_out: usize,
     l2_in: usize,
     l2_out: usize,
-    fv_scale: i32,
+    fv_scale: Option<i32>,
     psqt_buckets: Option<usize>,
     threat: Option<ThreatArch>,
+    effect_bucket: Option<EffectBucketArch>,
 ) -> String {
     let psqt_part = match psqt_buckets {
         Some(n) => format!("PSQT={n},"),
@@ -294,18 +320,23 @@ pub fn build_arch_str(
         Some(t) => format!("Threat={},", t.dims),
         None => String::new(),
     };
+    let effect_bucket_part = match effect_bucket {
+        Some(e) => format!("EffectBucket={},", e.token_value()),
+        None => String::new(),
+    };
+    let fv_scale_part = fv_scale.map_or_else(String::new, |n| format!(",fv_scale={n}"));
     format!(
-        "{},{}{}\
+        "{},{}{}{}\
          Network=AffineTransform[1<-{}](\
          ClippedReLU[{}](\
          AffineTransform[{}<-{}](\
          SqrClippedReLU[{}](\
          AffineTransform[{}<-{}](\
-         InputSlice[{}(0:{})]))))),\
-         fv_scale={}",
+         InputSlice[{}(0:{})]))))){}",
         features_token(feature_name, input_size, ft_out),
         psqt_part,
         threat_part,
+        effect_bucket_part,
         l2_out,     // Output input
         l2_out,     // L2 output / L3 input
         l2_out,     // L2 output
@@ -315,7 +346,7 @@ pub fn build_arch_str(
         ft_out * 2, // L1 input (dual perspective)
         ft_out * 2,
         ft_out * 2,
-        fv_scale,
+        fv_scale_part,
     )
 }
 
@@ -365,15 +396,17 @@ pub fn network_hash(feature_hash: u32, ft_out: usize, l2_out: usize) -> u32 {
 /// FT factorizer の仮想行を実行へ畳み込み、export 形状
 /// (`feature_set.ft_in() × ft_out`) の FT weight を返す。
 ///
-/// 学習時の FT weight は `[base real | threat real | 仮想 P plane]` の
-/// `train_ft_in × ft_out` (row-major、`ft_w[feat * ft_out + out]`)。仮想 P plane
-/// (`piece_inputs` 行) は **base 実行 (king-bucket セル `kb * piece_inputs + p`)
-/// のみ** に対応する king-bucket 非依存の prior。export では base 実行に
-/// `W_real[(kb, p)] += W_virtual[p]` で仮想行を畳み込んで固定し、仮想行を捨てる。
-/// threat real 行 (`[base_ft_in, ft_in())`) は仮想行を持たないので **そのまま
-/// 残す** (silent に切り落とさない)。戻り値は base 折り込み済み + threat 不可触の
-/// `ft_in() × ft_out`。量子化と飽和検査 (`warn_if_i16_saturates`) は畳み込み後の
-/// 値に掛けること (caller は本関数の戻り値で `LayerStackWeights::ft_w` を構築)。
+/// 学習時の FT weight は
+/// `[base real | threat real | virtual piece-input rows | virtual threat-pair rows]` の
+/// `train_ft_in × ft_out` (row-major、`ft_w[feat * ft_out + out]`)。base factorizer は
+/// 駒ごとに 1 仮想行を base の king-bucket 数 (HalfKA_hm 系では 45) で共有する。
+/// effect bucket は各駒特徴を NB 個の被攻撃×被防御バケットに分割し、
+/// `PoolEffectBuckets` では駒ごとに 1 仮想行を全バケットで共有し、`PerEffectBucket`
+/// では (駒, バケット) ごとに仮想行を持つ。virtual threat-pair rows は同じ threat
+/// pair に属する threat 実行へ共有される。export では実行に仮想行を畳み込んで固定し、
+/// 仮想行を捨てる。戻り値は base + threat 折り込み済みの `ft_in() × ft_out`。
+/// 量子化と飽和検査 (`warn_if_i16_saturates`) は畳み込み後の値に掛けること
+/// (caller は本関数の戻り値で `LayerStackWeights::ft_w` を構築)。
 ///
 /// factorizer 無効の spec では入力をそのまま返す。
 pub fn coalesce_ft_factorized(
@@ -387,22 +420,52 @@ pub fn coalesce_ft_factorized(
     let base_ft_in = feature_set.base_ft_in();
     let ft_in = feature_set.ft_in(); // base + threat (= 仮想行の手前まで)
     let piece_inputs = feature_set.piece_inputs();
+    let nb = feature_set.effect_bucket_config().map_or(1, |cfg| cfg.nb);
     let train_ft_in = feature_set.train_ft_in();
     assert_eq!(
         ft_w_train.len(),
         train_ft_in * ft_out,
         "ft_w length must be train_ft_in * ft_out"
     );
-    // 仮想 P plane は base+threat 実行の後ろ。export は実行部 (base + threat) を
-    // まず複製し、base king-bucket セルにのみ仮想行を加算する。
+    // virtual piece-input rows は base+threat 実行の後ろ。export は実行部 (base + threat)
+    // をまず複製し、base/effect-bucket 実行に対応する仮想行を加算する。
     let virtual_base = ft_in * ft_out;
     let mut out = ft_w_train[..virtual_base].to_vec();
-    for feat in 0..base_ft_in {
-        let p = feat % piece_inputs;
+    let base_virtual_rows =
+        feature_set.ft_factorize_virtual_rows() - feature_set.threat_factorize_pair_count();
+    let fold_ft_in = if feature_set.effect_bucket_config().is_some() {
+        ft_in
+    } else {
+        base_ft_in
+    };
+    for feat in 0..fold_ft_in {
+        let p = match feature_set.ft_factorize_mode() {
+            FtFactorizeMode::Base => feat % piece_inputs,
+            FtFactorizeMode::PoolEffectBuckets | FtFactorizeMode::PerEffectBucket => {
+                (feat / nb) % piece_inputs
+            }
+        };
+        let vrow = match feature_set.ft_factorize_mode() {
+            FtFactorizeMode::PerEffectBucket => p * nb + feat % nb,
+            FtFactorizeMode::Base | FtFactorizeMode::PoolEffectBuckets => p,
+        };
         let dst = feat * ft_out;
-        let src = virtual_base + p * ft_out;
+        let src = virtual_base + vrow * ft_out;
         for o in 0..ft_out {
             out[dst + o] += ft_w_train[src + o];
+        }
+    }
+    let threat_pair_starts = feature_set.threat_factorize_pair_starts();
+    let threat_virtual_base = ft_in + base_virtual_rows;
+    for pair in 0..threat_pair_starts.len().saturating_sub(1) {
+        let start = base_ft_in + threat_pair_starts[pair];
+        let end = base_ft_in + threat_pair_starts[pair + 1];
+        let src = (threat_virtual_base + pair) * ft_out;
+        for feat in start..end {
+            let dst = feat * ft_out;
+            for o in 0..ft_out {
+                out[dst + o] += ft_w_train[src + o];
+            }
         }
     }
     out
@@ -420,8 +483,8 @@ pub fn coalesce_ft_factorized(
 /// - `ft_b`: `(ft_out)` (stm/nstm 共有)
 /// - `l1_w`: `(num_buckets, l1_out, ft_out)` row-major、`l1_w[buc * l1_out * ft_out + out * ft_out + in]`
 /// - `l1_b`: `(num_buckets, l1_out)` row-major
-/// - `l1f_w`: `(ft_out, l1_out)` row-major、`l1f_w[in * l1_out + out]`
-/// - `l1f_b`: `(l1_out)` — FT 出力同様、長さがそのまま L1 出力次元 `l1_out`
+/// - `l1_shared_weight`: `(ft_out, l1_out)` row-major、`l1_shared_weight[in * l1_out + out]`
+/// - `l1_shared_bias`: `(l1_out)` — FT 出力同様、長さがそのまま L1 出力次元 `l1_out`
 /// - `l2_w`: `(num_buckets, l2_out, l2_in)` row-major、`l2_in = (l1_out - 1) * 2`
 /// - `l2_b`: `(num_buckets, l2_out)`
 /// - `l3_w`: `(num_buckets, l2_out)` (out_dim=1 なので out 軸省略)
@@ -439,8 +502,8 @@ pub struct LayerStackWeights {
     pub ft_b: Vec<f32>,
     pub l1_w: Vec<f32>,
     pub l1_b: Vec<f32>,
-    pub l1f_w: Vec<f32>,
-    pub l1f_b: Vec<f32>,
+    pub l1_shared_weight: Vec<f32>,
+    pub l1_shared_bias: Vec<f32>,
     pub l2_w: Vec<f32>,
     pub l2_b: Vec<f32>,
     pub l3_w: Vec<f32>,
@@ -480,8 +543,8 @@ impl LayerStackWeights {
             ft_b: vec![0.0; ft_out],
             l1_w: vec![0.0; num_buckets * l1_out * ft_out],
             l1_b: vec![0.0; num_buckets * l1_out],
-            l1f_w: vec![0.0; ft_out * l1_out],
-            l1f_b: vec![0.0; l1_out],
+            l1_shared_weight: vec![0.0; ft_out * l1_out],
+            l1_shared_bias: vec![0.0; l1_out],
             l2_w: vec![0.0; num_buckets * l2_out * l2_in],
             l2_b: vec![0.0; num_buckets * l2_out],
             l3_w: vec![0.0; num_buckets * l2_out],
@@ -506,10 +569,15 @@ impl LayerStackWeights {
 
     /// LayerStack quantised.bin を `writer` に書き出す。推論エンジン rshogi の
     /// `NetworkLayerStacks::read` で parse できる byte layout (`num_buckets` を
-    /// header から読む対応が rshogi 側で要る)。
-    pub fn save_quantised<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+    /// header から読む対応が rshogi 側で要る)。`fv_scale = None` のときは arch
+    /// string から `fv_scale` token を省略する。
+    pub fn save_quantised<W: Write>(
+        &self,
+        writer: &mut W,
+        fv_scale: Option<i32>,
+    ) -> io::Result<()> {
         // ---- header ---- (arch 文字列・hash は feature set + 層次元から導出)
-        // FT 出力次元は FT bias buffer の長さ、L1 出力次元は L1f bias buffer の長さ
+        // FT 出力次元は FT bias buffer の長さ、L1 出力次元は L1 shared bias buffer の長さ
         // (どちらも 1 perspective / 1 dim あたり 1 要素)。L2 出力次元は L2 bias buffer の
         // 長さを bucket 数で割った値 (`l2_b` は `(num_buckets, l2_out)`)。L2 入力次元は
         // L1 出力から導出。
@@ -538,7 +606,7 @@ impl LayerStackWeights {
             )
         })?;
         let ft_out = self.ft_b.len();
-        let l1_out = self.l1f_b.len();
+        let l1_out = self.l1_shared_bias.len();
         let l2_out = self.l2_b.len() / num_buckets;
         let l2_in = (l1_out - 1) * 2;
         let feature_hash = self.feature_set.feature_hash();
@@ -555,6 +623,13 @@ impl LayerStackWeights {
             dims: self.feature_set.threat_dims(),
             profile_id: p.profile_id(),
         });
+        let effect_bucket_arch =
+            self.feature_set
+                .effect_bucket_config()
+                .map(|c| EffectBucketArch {
+                    nb: c.nb,
+                    king_bucketed: c.king_bucketed,
+                });
         let arch_str = build_arch_str(
             self.feature_set.arch_feature_name(),
             self.feature_set.ft_in(),
@@ -562,9 +637,10 @@ impl LayerStackWeights {
             l1_out,
             l2_in,
             l2_out,
-            FV_SCALE,
+            fv_scale,
             psqt_buckets,
             threat_arch,
+            effect_bucket_arch,
         );
         let arch_bytes = arch_str.as_bytes();
         writer.write_all(&(arch_bytes.len() as u32).to_le_bytes())?;
@@ -595,11 +671,6 @@ impl LayerStackWeights {
         write_leb128_tensor_i16(writer, &ft_b_i16)?;
 
         // ---- FT weights LEB128 (i16, scale=QA) ----
-        // base 部分 = base_ft_in * ft_out のみを FT block に書く。threat 連結時の
-        // threat row は PSQT block の後ろの **Threat block** に分けて書く (engine が
-        // base FT block を threat 非対応のまま byte-identical に読めるように)。本
-        // trainer の ft_w は (ft_in, ft_out) row-major で base row が先頭に並ぶ。
-        let base_ft_w_n = self.feature_set.base_ft_in() * ft_out;
         if self.ft_w.len() != self.feature_set.ft_in() * ft_out {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -611,6 +682,13 @@ impl LayerStackWeights {
                 ),
             ));
         }
+        // threat は base FT block と raw i8 threat block に分ける。effect bucket は追加 block
+        // を持たず、拡張済み row 全体を通常の i16 FT block に書く。
+        let base_ft_w_n = if self.feature_set.threat_profile().is_some() {
+            self.feature_set.base_ft_in() * ft_out
+        } else {
+            self.feature_set.ft_in() * ft_out
+        };
         let ft_w_base = &self.ft_w[..base_ft_w_n];
         warn_if_i16_saturates("ft_w", ft_w_base, qa_f);
         let ft_w_i16: Vec<i16> = ft_w_base
@@ -678,6 +756,8 @@ impl LayerStackWeights {
         let l1_bias_scale = (QA * QB) as f64; // = 8128
         let l2_bias_scale = 127.0 * qb_f; // = 8128 (QA == 127 前提)
         let l3_bias_scale = 127.0 * qb_f; // = 8128
+        warn_if_i8_clamp_saturates("l2_w", &self.l2_w, qb_f);
+        warn_if_i8_clamp_saturates("l3_w", &self.l3_w, qb_f);
 
         let fc_hash = compute_fc_hash(ft_out, l2_out);
         for buc in 0..num_buckets {
@@ -687,20 +767,20 @@ impl LayerStackWeights {
             // --- L1 (merged delta + shared) ---
             // Biases: l1_out i32 scale = QA*QB = 8128
             for out in 0..l1_out {
-                let merged = self.l1_b[buc * l1_out + out] + self.l1f_b[out];
+                let merged = self.l1_b[buc * l1_out + out] + self.l1_shared_bias[out];
                 let val = (l1_bias_scale * merged as f64).round() as i32;
                 writer.write_all(&val.to_le_bytes())?;
             }
             // Weights: l1_out × pad32(ft_out) i8 scale = QB
             // For each (buc, out, in) in [0, l1_out) × [0, pad32(ft_out))
-            // - in < ft_out: merged = l1_w[buc][out][in] + l1f_w[in][out]
+            // - in < ft_out: merged = l1_w[buc][out][in] + l1_shared_weight[in][out]
             // - else: padding 0
             let l1_padded_in = pad32(ft_out);
             for out in 0..l1_out {
                 for in_idx in 0..l1_padded_in {
                     let q: i8 = if in_idx < ft_out {
                         let buc_w = self.l1_w[buc * l1_out * ft_out + out * ft_out + in_idx];
-                        let shared_w = self.l1f_w[in_idx * l1_out + out];
+                        let shared_w = self.l1_shared_weight[in_idx * l1_out + out];
                         let merged = buc_w + shared_w;
                         clamp_i8((qb_f * merged as f64).round())
                     } else {
@@ -752,17 +832,16 @@ impl LayerStackWeights {
 
     /// LayerStack quantised.bin を parse し `LayerStackWeights` を返す。
     ///
-    /// 注: save 時に per-bucket l1 と shared l1f は merge されて書き出されるため、
-    /// load 時には分離不能。本実装は **l1_w に merged 値をそのまま入れ、l1f_w /
-    /// l1f_b は 0 にする** 方針 (forward 計算は等価)。
+    /// 注: save 時に per-bucket L1 と L1 shared term は merge されて書き出されるため、
+    /// load 時には分離不能。本実装は **l1_w に merged 値をそのまま入れ、l1_shared_weight /
+    /// l1_shared_bias は 0 にする** 方針 (forward 計算は等価)。
     ///
-    /// **継続学習時の注意**: forward は等価でも、l1f が「shared factorized 部」と
-    /// しての意味は失われる (全て l1_w に畳まれた状態)。per-bucket l1 と shared
-    /// l1f を別々に学習し続ける場合と勾配の流れ方が変わるため、本 method で得た
-    /// `LayerStackWeights` から continue-training すると factorize を保ったまま
-    /// 学習した場合の軌跡とは厳密一致しない。「pretrained 注入 → 1 step → save し、
-    /// 出力 `.bin` が参照と byte 単位で一致するか」を確認する用途、あるいは l1f を
-    /// 再び factorize し直す前提なら問題ない。
+    /// **継続学習時の注意**: forward は等価でも、L1 shared term としての分解は失われる
+    /// (全て `l1_w` に畳まれた状態)。per-bucket L1 と L1 shared term を別々に学習し続ける
+    /// 場合と勾配の流れ方が変わるため、本 method で得た `LayerStackWeights` から
+    /// continue-training した軌跡とは厳密一致しない。「pretrained 注入 → 1 step → save
+    /// し、出力 `.bin` が参照と byte 単位で一致するか」を確認する用途、あるいは shared
+    /// term を再び分離する前提なら問題ない。
     /// `expected` は要求 feature set、`ft_out` は要求 FT 出力次元 (`--ft-out`)、
     /// `l1_out` は要求 L1 出力次元 (`--l1`)、`l2_out` は要求 L2 出力次元 (`--l2`)、
     /// `num_buckets` は要求 bucket 数 (`--num-buckets`)。file の arch 文字列・hash・
@@ -911,6 +990,13 @@ impl LayerStackWeights {
                     format!("arch_str has multiple ThreatProfile= tokens: `{arch_str}`"),
                 )
             })?;
+        let file_effect_bucket =
+            parse_single_arch_token(&arch_str, "EffectBucket=").map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("arch_str has multiple EffectBucket= tokens: `{arch_str}`"),
+                )
+            })?;
         let expected_threat = expected
             .threat_profile()
             .map(|p| (expected.threat_dims(), p.profile_id()));
@@ -957,6 +1043,38 @@ impl LayerStackWeights {
                     ));
                 }
             }
+        }
+        let expected_effect_bucket = expected
+            .effect_bucket_config()
+            .map(effect_bucket_arch_token_value);
+        match (expected_effect_bucket.as_deref(), file_effect_bucket) {
+            (Some(expected_token), Some(file_token)) if expected_token == file_token => {}
+            (Some(expected_token), Some(file_token)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "effect bucket config mismatch: file EffectBucket={file_token}, expected EffectBucket={expected_token} \
+                         (arch_str = `{arch_str}`)"
+                    ),
+                ));
+            }
+            (Some(expected_token), None) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "effect bucket requested but not present in arch_str (expected EffectBucket={expected_token}): `{arch_str}`"
+                    ),
+                ));
+            }
+            (None, Some(file_token)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "`.bin` has EffectBucket={file_token} but the requested feature set has no effect bucket config: `{arch_str}`"
+                    ),
+                ));
+            }
+            (None, None) => {}
         }
         let psqt_token = format!("PSQT={file_num_buckets},");
         let file_has_psqt = arch_str.contains(&psqt_token);
@@ -1039,9 +1157,13 @@ impl LayerStackWeights {
         let qa_f = QA as f32;
         let ft_b: Vec<f32> = ft_b_i16.iter().map(|&v| v as f32 / qa_f).collect();
 
-        // FT weights (LEB128 i16, base_ft_in * ft_out 個)。threat row は PSQT block
-        // の後ろの Threat block で読む (save 側と対称)。
-        let base_ft_w_n = expected.base_ft_in() * ft_out;
+        // FT weights (LEB128 i16)。threat row は PSQT block の後ろの Threat block
+        // で読む。effect bucket は拡張済み row 全体をこの block に持つ。
+        let base_ft_w_n = if expected.threat_profile().is_some() {
+            expected.base_ft_in() * ft_out
+        } else {
+            expected.ft_in() * ft_out
+        };
         let ft_w_i16 = read_leb128_tensor_i16(reader, Some(base_ft_w_n))?;
         let mut ft_w: Vec<f32> = ft_w_i16.iter().map(|&v| v as f32 / qa_f).collect();
 
@@ -1142,7 +1264,7 @@ impl LayerStackWeights {
                 l1_b[buc * l1_out + out] = v as f32 / l1_bias_scale;
             }
             // L1 weights (i8 × l1_out × l1_padded_in)、保存値は merged
-            // → l1_w に直接書き込み、l1f_w は 0 のまま (forward 等価)
+            // → l1_w に直接書き込み、l1_shared_weight は 0 のまま (forward 等価)
             for out in 0..l1_out {
                 for in_idx in 0..l1_padded_in {
                     let mut buf1 = [0u8; 1];
@@ -1194,8 +1316,8 @@ impl LayerStackWeights {
             ft_b,
             l1_w,
             l1_b,
-            l1f_w: vec![0.0; ft_out * l1_out], // save 時に l1_w に merge 済 → load 側は 0
-            l1f_b: vec![0.0; l1_out],
+            l1_shared_weight: vec![0.0; ft_out * l1_out], // save 時に l1_w に merge 済 → load 側は 0
+            l1_shared_bias: vec![0.0; l1_out],
             l2_w,
             l2_b,
             l3_w,
@@ -1243,6 +1365,14 @@ fn parse_single_arch_token<'a>(arch_str: &'a str, prefix: &str) -> Result<Option
         }
     }
     Ok(found)
+}
+
+fn effect_bucket_arch_token_value(config: EffectBucketConfig) -> String {
+    EffectBucketArch {
+        nb: config.nb,
+        king_bucketed: config.king_bucketed,
+    }
+    .token_value()
 }
 
 /// `round(scale·v)` が i16 範囲 `[-32768, 32767]` を超える要素数を数える。`scale`
@@ -1312,6 +1442,27 @@ fn warn_if_i8_saturates(name: &str, values: &[f32], scale: f64) {
     }
 }
 
+fn count_i8_clamp_saturations(values: &[f32], scale: f64) -> usize {
+    values
+        .iter()
+        .filter(|&&v| {
+            let q = (scale * v as f64).round();
+            q < i8::MIN as f64 || q > i8::MAX as f64
+        })
+        .count()
+}
+
+fn warn_if_i8_clamp_saturates(name: &str, values: &[f32], scale: f64) {
+    let n = count_i8_clamp_saturations(values, scale);
+    if n > 0 {
+        eprintln!(
+            "[nnue-format] warning: {name} has {n}/{} elements saturating i8 quantisation; \
+             folded values are clamped on export",
+            values.len()
+        );
+    }
+}
+
 // =============================================================================
 // tests
 // =============================================================================
@@ -1352,10 +1503,10 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_keeps_threat_rows_and_folds_only_base() {
+    fn coalesce_folds_base_and_threat_pair_virtual_rows() {
         use shogi_features::{FeatureSet, ThreatProfile};
         // factorizer × threat 同居: export 形状 = ft_in() (base+threat)、base 行は
-        // 仮想行を畳み込み、threat 行は不可触で残る。最小 profile (cross-side) を使う。
+        // virtual piece-input rows、threat 行は virtual threat-pair rows を畳み込む。
         let spec = FeatureSet::HalfKaHmMerged
             .spec()
             .with_threat_profile(ThreatProfile::CrossSide)
@@ -1363,8 +1514,10 @@ mod tests {
         let base_ft_in = spec.base_ft_in();
         let ft_in = spec.ft_in(); // base + threat
         let pi = spec.piece_inputs();
+        let pair_starts = spec.threat_factorize_pair_starts();
+        let pair_count = pair_starts.len() - 1;
         let ft_out = 2usize;
-        assert_eq!(spec.train_ft_in(), ft_in + pi);
+        assert_eq!(spec.train_ft_in(), ft_in + pi + pair_count);
 
         let mut w = vec![0.0f32; spec.train_ft_in() * ft_out];
         // base 実行 / threat 実行 / 仮想行を distinctive 値で埋める。
@@ -1378,6 +1531,11 @@ mod tests {
                 w[(ft_in + p) * ft_out + o] = 10_000.0 + p as f32 + o as f32 * 0.25;
             }
         }
+        for pair in 0..pair_count {
+            for o in 0..ft_out {
+                w[(ft_in + pi + pair) * ft_out + o] = 20_000.0 + pair as f32 + o as f32 * 0.125;
+            }
+        }
         let out = coalesce_ft_factorized(&spec, ft_out, &w);
         // export 形状は base + threat (仮想行を落とす)。
         assert_eq!(out.len(), ft_in * ft_out);
@@ -1389,14 +1547,14 @@ mod tests {
                 assert_eq!(out[feat * ft_out + o], want, "base feat={feat} o={o}");
             }
         }
-        // threat 行は不可触 (元の値のまま、仮想行を加算しない)。
+        // threat 行は同じ pair の仮想行を加算する。
         for feat in [base_ft_in, base_ft_in + 1, ft_in - 1] {
+            let rel = feat - base_ft_in;
+            let pair = pair_starts.partition_point(|&start| start <= rel) - 1;
             for o in 0..ft_out {
-                assert_eq!(
-                    out[feat * ft_out + o],
-                    feat as f32 + o as f32 * 0.5,
-                    "threat feat={feat} o={o} は不可触のはず"
-                );
+                let want =
+                    (feat as f32 + o as f32 * 0.5) + (20_000.0 + pair as f32 + o as f32 * 0.125);
+                assert_eq!(out[feat * ft_out + o], want, "threat feat={feat} o={o}");
             }
         }
     }
@@ -1406,7 +1564,7 @@ mod tests {
         use shogi_features::{FeatureSet, ThreatProfile};
         // boundary 網羅: 全 base featureset × 全 profile で同居 coalesce が
         // (a) export 形状 = ft_in()*ft_out、(b) base 行 = 実行 + 同 p 仮想行、
-        // (c) threat 行不可触、を満たす。`base_ft_in % piece_inputs == 0` も確認。
+        // (c) threat 行 = 実行 + pair 仮想行、を満たす。`base_ft_in % piece_inputs == 0` も確認。
         let ft_out = 2usize;
         for fs in FeatureSet::ALL {
             for profile in [
@@ -1414,12 +1572,15 @@ mod tests {
                 ThreatProfile::SameClass,
                 ThreatProfile::SameClassMajorPawn,
                 ThreatProfile::StepAttacker,
+                ThreatProfile::FullSymDedup,
                 ThreatProfile::CrossSide,
             ] {
                 let spec = fs.spec().with_threat_profile(profile).with_ft_factorize();
                 let base_ft_in = spec.base_ft_in();
                 let ft_in = spec.ft_in();
                 let pi = spec.piece_inputs();
+                let pair_starts = spec.threat_factorize_pair_starts();
+                let pair_count = pair_starts.len() - 1;
                 assert_eq!(
                     base_ft_in % pi,
                     0,
@@ -1437,6 +1598,11 @@ mod tests {
                 for p in 0..pi {
                     for o in 0..ft_out {
                         w[(ft_in + p) * ft_out + o] = 1000.0 + (p % 13) as f32;
+                    }
+                }
+                for pair in 0..pair_count {
+                    for o in 0..ft_out {
+                        w[(ft_in + pi + pair) * ft_out + o] = 2000.0 + (pair % 17) as f32;
                     }
                 }
                 let out = coalesce_ft_factorized(&spec, ft_out, &w);
@@ -1462,11 +1628,15 @@ mod tests {
                     }
                 }
                 for &feat in &[base_ft_in, ft_in - 1] {
+                    let rel = feat - base_ft_in;
+                    let pair = pair_starts.partition_point(|&start| start <= rel) - 1;
                     for o in 0..ft_out {
+                        let want =
+                            ((feat % 97) as f32 + o as f32 * 0.5) + (2000.0 + (pair % 17) as f32);
                         assert_eq!(
                             out[feat * ft_out + o],
-                            (feat % 97) as f32 + o as f32 * 0.5,
-                            "{} {profile} threat feat={feat} 不可触",
+                            want,
+                            "{} {profile} threat feat={feat} pair={pair}",
                             fs.canonical_name()
                         );
                     }
@@ -1499,6 +1669,18 @@ mod tests {
         // round 後判定: 32767.4→32767 (範囲内)、32767.5→32768 (飽和)。
         assert_eq!(count_i16_saturations(&[32767.4], 1.0), 0);
         assert_eq!(count_i16_saturations(&[32767.5], 1.0), 1);
+    }
+
+    #[test]
+    fn count_i8_clamp_saturations_matches_export_bounds() {
+        assert_eq!(
+            count_i8_clamp_saturations(&[-128.0, 127.0, -129.0, 128.0], 1.0),
+            2
+        );
+        assert_eq!(
+            count_i8_clamp_saturations(&[-128.49, 127.49, -128.5, 127.5], 1.0),
+            2
+        );
     }
 
     /// テストで使う feature set spec (現 production の halfka-hm-merged)。
@@ -1558,7 +1740,7 @@ mod tests {
             DEFAULT_NUM_BUCKETS,
         );
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         let mut cursor = std::io::Cursor::new(&buf);
         let loaded = LayerStackWeights::load_quantised(
             &mut cursor,
@@ -1587,6 +1769,12 @@ mod tests {
         FeatureSet::HalfKaHmMerged
             .spec()
             .with_threat_profile(profile)
+    }
+
+    fn effect_bucket_spec(config: EffectBucketConfig) -> FeatureSetSpec {
+        FeatureSet::HalfKaHmMerged
+            .spec()
+            .with_effect_bucket_config(config)
     }
 
     #[test]
@@ -1645,7 +1833,7 @@ mod tests {
         original.ft_w[base_ft_w_n + 1] = 5.0 / 127.0; // threat: 5/127
 
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
 
         // arch_str は rshogi 契約: `Threat=<dims>` + cross-side (id 10≠0) は
         // `ThreatProfile=10` も付く。token は dims 値で、profile 名は使わない。
@@ -1695,7 +1883,7 @@ mod tests {
             DEFAULT_NUM_BUCKETS,
         );
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
 
         let mut cursor = std::io::Cursor::new(&buf);
         let err = LayerStackWeights::load_quantised(
@@ -1726,7 +1914,7 @@ mod tests {
             DEFAULT_NUM_BUCKETS,
         );
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
 
         let mut cursor = std::io::Cursor::new(&buf);
         let err = LayerStackWeights::load_quantised(
@@ -1762,7 +1950,7 @@ mod tests {
         original.ft_w[base_ft_w_n] = 1.0; // threat row 端値 (127/127)
 
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         let arch = String::from_utf8_lossy(&buf);
         assert!(
             arch.contains(&format!("Threat={},", spec.threat_dims())),
@@ -1807,7 +1995,7 @@ mod tests {
         original.ft_w[base_ft_w_n + 1] = -5.0 / 127.0; // → i8 -5
 
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
 
         // threat block は末尾 (LayerStacks の前) ではなく、save 順では PSQT(無)→
         // Threat(u32 id + i8...)→LayerStacks。threat block の長さは 4 (u32) +
@@ -1832,6 +2020,68 @@ mod tests {
     }
 
     #[test]
+    fn effect_bucket_save_load_roundtrip_preserves_expanded_ft_rows() {
+        let spec = effect_bucket_spec(EffectBucketConfig::KINGFIXED_2X2);
+        let ft_out = 128;
+        let mut original = LayerStackWeights::zeroed(
+            spec,
+            ft_out,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        );
+        assert_eq!(original.ft_w.len(), spec.ft_in() * ft_out);
+        let last = original.ft_w.len() - 1;
+        original.ft_w[0] = 1.0;
+        original.ft_w[last] = -5.0 / 127.0;
+
+        let mut buf = Vec::new();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
+        let arch = String::from_utf8_lossy(&buf);
+        assert!(arch.contains("EffectBucket=2x2fixed,"), "{arch}");
+        assert!(!arch.contains("Threat="), "{arch}");
+
+        let loaded = LayerStackWeights::load_quantised(
+            &mut std::io::Cursor::new(&buf),
+            spec,
+            ft_out,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        )
+        .unwrap();
+        assert_eq!(loaded.ft_w.len(), original.ft_w.len());
+        assert!((loaded.ft_w[0] - 1.0).abs() < 1e-6);
+        assert!((loaded.ft_w[last] - (-5.0 / 127.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn effect_bucket_load_rejects_config_mismatch() {
+        let ft_out = 128;
+        let saved = effect_bucket_spec(EffectBucketConfig::KINGFIXED_2X2);
+        let original = LayerStackWeights::zeroed(
+            saved,
+            ft_out,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        );
+        let mut buf = Vec::new();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
+
+        let err = LayerStackWeights::load_quantised(
+            &mut std::io::Cursor::new(&buf),
+            effect_bucket_spec(EffectBucketConfig::KINGBUCKETED_2X2),
+            ft_out,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn non_default_ft_out_save_load_roundtrip() {
         // 既定外の FT 出力次元で zeroed → save → load しても layout が対称で、
         // buffer 長が ft_out に追従する。
@@ -1846,7 +2096,7 @@ mod tests {
         assert_eq!(original.ft_b.len(), ft_out);
         assert_eq!(original.ft_w.len(), test_spec().ft_in() * ft_out);
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         let loaded = LayerStackWeights::load_quantised(
             &mut std::io::Cursor::new(&buf),
             test_spec(),
@@ -1888,7 +2138,7 @@ mod tests {
             DEFAULT_L2_OUT,
             DEFAULT_NUM_BUCKETS,
         );
-        assert_eq!(original.l1f_b.len(), l1_out);
+        assert_eq!(original.l1_shared_bias.len(), l1_out);
         assert_eq!(
             original.l1_w.len(),
             DEFAULT_NUM_BUCKETS * l1_out * DEFAULT_FT_OUT
@@ -1898,7 +2148,7 @@ mod tests {
             DEFAULT_NUM_BUCKETS * DEFAULT_L2_OUT * l2_in
         );
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         let loaded = LayerStackWeights::load_quantised(
             &mut std::io::Cursor::new(&buf),
             test_spec(),
@@ -1947,7 +2197,7 @@ mod tests {
         assert_eq!(original.l2_w.len(), DEFAULT_NUM_BUCKETS * l2_out * l2_in);
         assert_eq!(original.l3_w.len(), DEFAULT_NUM_BUCKETS * l2_out);
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         let loaded = LayerStackWeights::load_quantised(
             &mut std::io::Cursor::new(&buf),
             test_spec(),
@@ -1988,7 +2238,7 @@ mod tests {
             DEFAULT_L2_OUT,
             DEFAULT_NUM_BUCKETS,
         )
-        .save_quantised(&mut buf)
+        .save_quantised(&mut buf, Some(FV_SCALE))
         .unwrap();
 
         let ok = LayerStackWeights::load_quantised(
@@ -2126,7 +2376,7 @@ mod tests {
         )
         .unwrap();
         let mut writer = std::io::BufWriter::new(std::fs::File::create(&out_path).unwrap());
-        weights.save_quantised(&mut writer).unwrap();
+        weights.save_quantised(&mut writer, Some(FV_SCALE)).unwrap();
         drop(writer);
 
         let in_size = in_bytes.len() as i64;
@@ -2192,7 +2442,8 @@ mod tests {
             DEFAULT_L1_OUT,
             (DEFAULT_L1_OUT - 1) * 2,
             DEFAULT_L2_OUT,
-            FV_SCALE,
+            Some(FV_SCALE),
+            None,
             None,
             None,
         );
@@ -2210,6 +2461,47 @@ mod tests {
     }
 
     #[test]
+    fn arch_str_omits_fv_scale_when_absent() {
+        let s = build_arch_str(
+            "HalfKaHmMerged",
+            test_spec().ft_in(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            (DEFAULT_L1_OUT - 1) * 2,
+            DEFAULT_L2_OUT,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!s.contains("fv_scale"), "{s}");
+        assert!(s.ends_with(")))))"), "{s}");
+    }
+
+    #[test]
+    fn quantised_net_without_fv_scale_loads() {
+        let original = LayerStackWeights::zeroed(
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        );
+        let mut buf = Vec::new();
+        original.save_quantised(&mut buf, None).unwrap();
+
+        LayerStackWeights::load_quantised(
+            &mut std::io::Cursor::new(buf),
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        )
+        .expect("fv_scale を省略した arch string も load できる");
+    }
+
+    #[test]
     fn build_arch_str_with_psqt_inserts_token() {
         // psqt_buckets = Some(9) で `PSQT=9,` token が Features と Network の間に入る。
         let s = build_arch_str(
@@ -2219,8 +2511,9 @@ mod tests {
             16,
             30,
             32,
-            28,
+            Some(28),
             Some(9),
+            None,
             None,
         );
         assert!(s.contains("PSQT=9,"));
@@ -2244,12 +2537,13 @@ mod tests {
             16,
             30,
             32,
-            28,
+            Some(28),
             None,
             Some(ThreatArch {
                 dims: 96_320,
                 profile_id: 10,
             }),
+            None,
         );
         assert!(with_id.contains("Threat=96320,"), "{with_id}");
         assert!(with_id.contains("ThreatProfile=10,"), "{with_id}");
@@ -2263,17 +2557,60 @@ mod tests {
             16,
             30,
             32,
-            28,
+            Some(28),
             None,
             Some(ThreatArch {
                 dims: 216_720,
                 profile_id: 0,
             }),
+            None,
         );
         assert!(id_zero.contains("Threat=216720,"), "{id_zero}");
         assert!(
             !id_zero.contains("ThreatProfile="),
             "id 0 は ThreatProfile token を省く: {id_zero}"
+        );
+    }
+
+    #[test]
+    fn build_arch_str_effect_bucket_token_uses_bucket_count_and_king_mode() {
+        let s = build_arch_str(
+            "HalfKaHmMerged",
+            293_220,
+            1536,
+            16,
+            30,
+            32,
+            Some(28),
+            None,
+            None,
+            Some(EffectBucketArch {
+                nb: 4,
+                king_bucketed: false,
+            }),
+        );
+        assert!(s.contains("EffectBucket=2x2fixed,"), "{s}");
+        assert!(s.find("EffectBucket=2x2fixed,").unwrap() < s.find("Network=").unwrap());
+    }
+
+    #[test]
+    fn effect_bucket_arch_rejects_unsupported_bucket_count() {
+        let err = std::panic::catch_unwind(|| {
+            let _ = EffectBucketArch {
+                nb: 5,
+                king_bucketed: false,
+            }
+            .token_value();
+        })
+        .expect_err("unsupported EffectBucket bucket count must panic");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            msg.contains("unsupported EffectBucket bucket count: 5"),
+            "panic message should mention the unsupported bucket count: {msg}"
         );
     }
 
@@ -2292,7 +2629,7 @@ mod tests {
         );
 
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         let loaded = LayerStackWeights::load_quantised_with_psqt(
             &mut std::io::Cursor::new(&buf),
             test_spec(),
@@ -2327,7 +2664,7 @@ mod tests {
         psqt[(test_spec().ft_in() - 1) * DEFAULT_NUM_BUCKETS + 5] = 7.0 * lsb;
 
         let mut buf = Vec::new();
-        net.save_quantised(&mut buf).unwrap();
+        net.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         let loaded = LayerStackWeights::load_quantised_with_psqt(
             &mut std::io::Cursor::new(&buf),
             test_spec(),
@@ -2362,7 +2699,7 @@ mod tests {
             DEFAULT_NUM_BUCKETS,
         );
         let mut buf = Vec::new();
-        net.save_quantised(&mut buf).unwrap();
+        net.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         let err = LayerStackWeights::load_quantised(
             &mut std::io::Cursor::new(&buf),
             test_spec(),
@@ -2386,7 +2723,7 @@ mod tests {
             DEFAULT_NUM_BUCKETS,
         );
         let mut buf = Vec::new();
-        net.save_quantised(&mut buf).unwrap();
+        net.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         let err = LayerStackWeights::load_quantised_with_psqt(
             &mut std::io::Cursor::new(&buf),
             test_spec(),
@@ -2435,7 +2772,7 @@ mod tests {
             DEFAULT_NUM_BUCKETS,
         );
         let mut buf = Vec::new();
-        net.save_quantised(&mut buf).unwrap();
+        net.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
 
         // bucket 3 の bias cell (i32 LE) を非ゼロに書き換える。
         // raw i32 = 16256 → dequant = 16256 / 8128 = 2.0 (整然と確認できる値)。
@@ -2488,7 +2825,7 @@ mod tests {
             DEFAULT_NUM_BUCKETS,
         );
         let mut buf = Vec::new();
-        net.save_quantised(&mut buf).unwrap();
+        net.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         // bias 領域 9 個の i32 LE が全て 0 であることを直接確認する (zero-branch を
         // どの bucket でも通る前提の test)。
         let bias_start = psqt_bias_start(buf.len(), test_spec().ft_in());
@@ -2531,8 +2868,8 @@ mod tests {
         );
         let mut buf_w = Vec::new();
         let mut buf_wo = Vec::new();
-        with.save_quantised(&mut buf_w).unwrap();
-        without.save_quantised(&mut buf_wo).unwrap();
+        with.save_quantised(&mut buf_w, Some(FV_SCALE)).unwrap();
+        without.save_quantised(&mut buf_wo, Some(FV_SCALE)).unwrap();
         let arch_token_len = "PSQT=9,".len();
         let psqt_bytes = (DEFAULT_NUM_BUCKETS + ft_in * DEFAULT_NUM_BUCKETS) * 4;
         assert_eq!(

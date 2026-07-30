@@ -13,7 +13,7 @@ tatara は **cuda-oxide** (NVIDIA Labs の Rust → PTX rustc backend) を中核
 | OS | 位置づけ | 手順 |
 |---|---|---|
 | Linux | 一級サポート (Ubuntu 22.04 / 24.04 で確認) | 本ファイルの手順をそのまま実行 |
-| Windows | WSL2 (Ubuntu) 経由でサポート。native Windows は cuda-oxide が公式に非サポート (CPU-only crate のみ native でビルド可) | 先に「Windows (WSL2) の準備」、以降は Linux と共通 |
+| Windows | WSL2 は既定 backend。CUDA C++ backend により native Windows も実験的に対応 | native は「Windows native (実験的)」、WSL2 は「Windows (WSL2) の準備」 |
 | macOS | GPU ビルドは非対応 | リモートの Linux + NVIDIA GPU で作業 (下記) |
 
 cuda-oxide と本リポの GPU crate は **NVIDIA GPU + CUDA Toolkit** を前提とする。
@@ -26,6 +26,109 @@ macOS は SSH / エディタとして使う。CPU-only crate (`shogi-format` /
 macOS でも可能だが、`cargo build` を workspace 全体に掛けると cuda-oxide 依存の
 ビルドで失敗する。
 
+## Windows native (実験的)
+
+`native-cuda-host` feature は cuda-oxide を使わず、NVCC で build した CUDA C++
+kernel を portable Rust CUDA Driver API runtime から
+起動する。Windows 11、RTX 5090、driver 596.36、CUDA Toolkit 12.9.86、Visual
+Studio 2022 (MSVC 19.44)、Rust nightly-2026-04-03 で build、GPU smoke、trainer の
+1 step を確認済み。現時点では実験 backend であり、既定 backend は引き続き
+Linux / WSL2 の cuda-oxide である。
+
+### 前提の install
+
+1. NVIDIA driver と **CUDA Toolkit 12.x** を Windows host に install する。driver
+   だけでは `nvcc.exe`、`cuda.lib`、`cublas.lib` が無いため build できない。
+2. Visual Studio 2022 または Build Tools 2022 で「C++ によるデスクトップ開発」を
+   install する。通常の PowerShell で `cl.exe` が見えない場合は Developer
+   PowerShell for VS 2022 を使う。
+3. Rustup を install する。repository 内で最初に `cargo` を実行すると
+   `rust-toolchain.toml` の pinned nightly が install される。
+4. Smart App Control が有効な Windows 11 では、Cargo が生成する未署名の build
+   script / test `.exe` が OS error 4551 で遮断される場合がある。継続的に native
+   Rust 開発を行う開発機では Windows セキュリティの「アプリとブラウザー
+   コントロール」→「Smart App Control」でオフにする。Microsoft Defender と
+   メモリ整合性を無効にする必要はない。Smart App Control は一度オフにすると通常は
+   Windows の reset / reinstall なしにオンへ戻せないため、WSL2 のみを使う場合は
+   オンのままでよい。
+
+新規 install 後は terminal を開き直す。開き直さず続行する場合は、Developer
+PowerShell で `CUDA_PATH` と DLL 検索用 `PATH` を明示する:
+
+```powershell
+$env:CUDA_PATH = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
+$env:PATH = "$env:CUDA_PATH\bin;$env:PATH"
+nvidia-smi
+nvcc --version
+cl
+rustc -Vv
+cargo -V
+```
+
+`CUDA_PATH\lib\x64\cuda.lib` と `cublas.lib` も存在することを確認する。
+`CUDA_PATH` だけを設定して `PATH` に `CUDA_PATH\bin` を加えないと、build は通っても
+trainer 起動時に cuBLAS DLL を解決できず `STATUS_DLL_NOT_FOUND (0xc0000135)` になる。
+
+CUDA C++ kernel source は UTF-8 のコメントを含む。repository の build script は Windows
+で NVCC の host compiler（MSVC）へ `/utf-8` を自動で渡す。古い commit や source を
+NVCC で直接 compile するときに warning C4819 と、直後の定数について
+`identifier ... is undefined` が同時に出る場合は、MSVC が source を CP932 として
+誤解釈している。Developer PowerShell で `$env:CL = '/utf-8'` を設定して再実行する。
+
+### build と smoke test
+
+既定 feature を無効化し、必ず `native-cuda-host` だけを指定する:
+
+```powershell
+cargo tree -p nnue-trainer --no-default-features --features native-cuda-host |
+  Select-String 'cuda-core|cuda-host|cuda-device'
+# 出力が空であること
+
+cargo build -p nnue-trainer --no-default-features --features native-cuda-host --release
+cargo test -p cuda-native-runtime --features native-cuda --release -- --nocapture
+cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release
+cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple
+```
+
+最後のコマンドは教師データを使わず、nativeの対応範囲に限定したGPU smokeを実行する。
+末尾に`[smoke/simple] PASSED`が出れば成功。
+
+production CLI、dataloader、拡張 WRM、factorizer、全 FP16 経路、TF32、AdamW、
+norm loss、2 種の checkpoint format を短い 1 run でまとめて確認する:
+
+```powershell
+$smokeOut = Join-Path ([System.IO.Path]::GetTempPath()) 'tatara-native-simple-cli'
+cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple `
+  --data crates/shogi-format/tests/data/sample.psv --output $smokeOut --net-id native-simple-cli `
+  --feature-set halfka-hm-merged --arch 8x2-8-8 --activation pairwise `
+  --superbatches 1 --batches-per-superbatch 1 --batch-size 64 --threads 1 --save-rate 1 `
+  --win-rate-model --scale 600 --wrm-nnue2score 600 `
+  --loss-pow-exp 2.5 --loss-qp-asymmetry 0.2 `
+  --loss-weight-boost-w1 1.5 --loss-weight-boost-w2 0.75 `
+  --optimizer adamw --weight-decay 0.0001 `
+  --norm-loss --norm-loss-factor 0.0001 --all-optim
+Get-Item "$smokeOut/native-simple-cli-1.bin", "$smokeOut/native-simple-cli-1.ckpt"
+```
+
+正常終了し、両 file が空でないことを確認する。
+
+同一の固定memory上fixtureでOS間throughputを比較する場合は次を実行する:
+
+```powershell
+cargo run -p nnue-trainer --release --no-default-features --features native-cuda-host -- `
+  native-bench --architecture all --precision all
+```
+
+LayerStackとSimpleのFP32/all-optimを測り、各runと環境情報をJSONに保存する。固定profile、
+WSL backend比較mode、統計、結果の扱いは[Native CUDA benchmark](native-cuda-benchmark.ja.md)
+を参照。
+
+現在の対応範囲は Simple (HalfKaHmMerged を含む) と LayerStack。Simpleは CReLU /
+SCReLU / Pairwise と任意のhidden dimensionに対応する。LayerStackは可変層次元とbucket
+mode、PSQT、feature factorizer、threat / effect featureに対応する。両architectureとも
+FP32 / FP16 option/state (TF32 ON / OFF)、Sigmoid / WRM (拡張設定を含む)、norm loss、
+Ranger / RAdam / AdamWを利用でき、各trainerが起動し得る全kernelを収録する。
+
 ## Windows (WSL2) の準備
 
 native Windows での cuda-oxide ビルドは **upstream が公式に非サポート**。
@@ -34,8 +137,8 @@ currently targets Linux only. Windows is not supported." と明記する。加�
 cuda-oxide は rustc internal
 ABI に直結する experimental backend で、本リポの `build.rs` も CUDA toolkit
 root を Linux パス (`/usr/local/cuda` / `lib64/libcublas.so`) で解決する。
-したがって GPU crate (`gpu-runtime` / `bins/*`) は Windows では
-**WSL2 + Ubuntu** を使う。WSL2 からは NVIDIA GPU が CUDA 経由で見えるため、
+したがって既定の cuda-oxide backend で GPU crate (`gpu-runtime` / `bins/*`) を
+使う場合は **WSL2 + Ubuntu** を使う。WSL2 からは NVIDIA GPU が CUDA 経由で見えるため、
 WSL2 内では本ファイルの Linux 手順がそのまま通る (cuda-oxide が公式にテスト
 しているのも Ubuntu 24.04)。
 
@@ -68,7 +171,7 @@ cargo test --workspace --exclude gpu-runtime --exclude progress-kpabs-train --ex
 
 | 項目 | 要件 | 備考 |
 |---|---|---|
-| OS | Linux / WSL2 (Windows) | 「対応 OS」参照 |
+| OS | Linux / WSL2、実験 backend は native Windows | 「対応 OS」参照 |
 | CUDA Toolkit | 12.x (12.9 で確認) | nvcc, libNVVM, nvJitLink, **libcublas** |
 | LLVM | **21+ (floor)、22 推奨** | apt.llvm.org が jammy / noble の両方に LLVM 20/21/22 を提供。`llc-22` が PATH にあれば cuda-oxide が優先する |
 | Clang | **clang-21 or 22** + `libclang-common-{21,22}-dev` | `cuda-bindings` の bindgen に必要 (LLVM 22 にしても clang-21/22 のどちらかが要る) |
@@ -77,7 +180,7 @@ cargo test --workspace --exclude gpu-runtime --exclude progress-kpabs-train --ex
 
 ## CUDA toolkit root の解決
 
-`bins/nnue_train` は **libcublas** に dynamic link する (L1f weight backward を
+`bins/nnue_train` は **libcublas** に dynamic link する (L1 shared weight backward を
 `cublasSgemm_v2` で実行するため)。build.rs / runtime ともに以下の優先順で CUDA
 toolkit root を探す:
 
@@ -170,6 +273,9 @@ bash scripts/setup-cuda-oxide.sh
 - host 前提 (rustup / cargo / llc / clang / nvcc) の有無をチェックして報告
   (システムパッケージの install はしない)
 - その rev で `cargo install --git ... cargo-oxide` を実行
+- **codegen backend cache** (`~/.cargo/cuda-oxide/`) も同じ rev になっているか
+  検証し、なっていなければ pin rev から作り直す (理由は後述の
+  「トラブルシューティング」参照)
 - `cargo-oxide doctor` で環境を診断
 
 スクリプトを使わず手動で入れる場合は、`Cargo.lock` の cuda-oxide rev に
@@ -180,10 +286,11 @@ rev=$(grep -m1 -oE 'cuda-oxide\.git\?rev=[0-9a-f]+' Cargo.lock | sed 's/.*rev=//
 cargo install --git https://github.com/NVlabs/cuda-oxide.git --rev "$rev" --force cargo-oxide
 ```
 
-`~/.cargo/bin` を PATH に通しておくこと。スクリプトは毎回 pin rev で
-`cargo-oxide` を入れ直すので、cuda-oxide の rev を bump したとき (library 側
-`Cargo.toml` を更新したとき) も同じく `bash scripts/setup-cuda-oxide.sh` を
-再実行すればよい。
+`~/.cargo/bin` を PATH に通しておくこと。スクリプトは毎回 `cargo-oxide` と
+backend cache の両方を pin rev に揃え直す (揃っていれば no-op) ので、
+cuda-oxide の rev を bump したとき (library 側 `Cargo.toml` を更新したとき)
+や、後述の backend cache の版ずれ問題に遭遇したときも、同じく
+`bash scripts/setup-cuda-oxide.sh` を再実行すればよい。
 
 ## Smoke test
 
@@ -293,6 +400,32 @@ pin し、`scripts/setup-cuda-oxide.sh` が `cargo-oxide` を同 rev に揃え�
 
 ## トラブルシューティング
 
+### 他の人では再現しない device codegen エラー (cuda-oxide backend cache の版ずれ)
+
+症状: `cargo-oxide build` が `rustc_codegen_cuda` 内で device codegen エラー
+(例: "Unsupported construct" 系の翻訳失敗) を出して失敗するが、同じ source が
+他の contributor や CI では問題なくビルドできる。OS / GPU / LLVM の構成も
+特に他と変わらないように見える。
+
+原因: `cargo-oxide` の codegen backend
+(`~/.cargo/cuda-oxide/librustc_codegen_cuda.so`) は**一度きり、rev 指定なしで
+fetch される**。ある機械で初めて何らかの `cargo-oxide` コマンドを実行した
+瞬間の upstream cuda-oxide `main` HEAD を shallow clone してビルド・cache し、
+以降は本リポジトリの `Cargo.lock` が pin する rev とは一切照合されない。
+`cargo install --rev` で `cargo-oxide` の CLI 本体を pin rev に入れ直しても、
+この backend cache には触れない — CLI バイナリと、それが駆動する backend
+`.so` は別々の成果物だからだ。backend cache がたまたま pin rev から構造的に
+乖離した `main` HEAD (cuda-oxide の MIR 翻訳層は頻繁に変わる) から作られて
+いた場合、pin rev と正しく揃った環境では出ない翻訳エラーに遭遇しうる。
+
+対応: `bash scripts/setup-cuda-oxide.sh` がこれを検知・修復するようになった。
+pin rev + 手元の rustc nightly version を backend cache に stamp として
+書き込み、次回実行時にこの stamp が食い違っていれば pin rev から cache を
+作り直す (仕組みの詳細は
+[該当 ADR](decisions/2026-07-04-cuda-oxide-backend-cache-pin.md) を参照)。
+既に揃っていれば再実行しても no-op。それでも解消しない場合の最終手段として
+`rm -rf ~/.cargo/cuda-oxide` してから再実行する。
+
 ### `cargo build` の ICE: "Missing SyntaxContext NN for crate alloc/core/std"
 
 症状: `cargo build` が `rustc` 内で panic し、`Missing SyntaxContext NN for
@@ -320,6 +453,8 @@ cargo build
 
 - [cuda-oxide adoption ADR](decisions/2026-05-09-cuda-oxide-adoption.md) —
   採用判断と Consequences
+- [cuda-oxide backend cache pin ADR](decisions/2026-07-04-cuda-oxide-backend-cache-pin.md) —
+  `setup-cuda-oxide.sh` が codegen backend cache も検証する理由
 - [cuda-oxide upstream](https://github.com/NVlabs/cuda-oxide)
 - [cuda-oxide-book installation requirements](https://nvlabs.github.io/cuda-oxide/getting-started/installation.html)
 - [cuda-oxide atomics example README (LLVM 22 syncscope の根拠)](https://github.com/NVlabs/cuda-oxide/blob/main/crates/rustc-codegen-cuda/examples/atomics/README.md)

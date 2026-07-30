@@ -16,8 +16,8 @@
 //! - **per-perspective post**: bias add → CReLU → pairwise_mul (ft_out→ft_out/2) → ×127/128
 //! - **combined**: stm.concat(nstm) → ft_out
 //! - **L1 (per-bucket)**: weight (9×16, ft_out) + bias (9×16) → select(bucket) → 16
-//! - **L1f (shared)**: weight (ft_out, 16) + bias (16) → 16
-//! - **l1_out_t**: L1_select + L1f → 16; slice → l1_main (15) + l1_skip (1)
+//! - **L1 shared**: weight (ft_out, 16) + bias (16) → 16
+//! - **l1_out_t**: L1_select + L1 shared → 16; slice → l1_main (15) + l1_skip (1)
 //! - **l1_sqr**: l1_main^2 * 127/128 → 15
 //! - **l2_input**: CReLU(concat(l1_sqr, l1_main)) → 30
 //! - **L2 (per-bucket)**: weight (9×32, 30) + bias (9×32) → select(bucket) → CReLU → 32
@@ -38,6 +38,37 @@
 //! - `f32::sqrt`, `f32::exp` は libdevice (`__nv_sqrtf`, `__nv_expf`) に lowering OK
 //! - atomic add パターン: `unsafe { &*(slice.as_ptr().add(idx) as *const DeviceAtomicX) }
 //!   .fetch_add(_, AtomicOrdering::Relaxed)`
+
+// f16 格納値を有限域へ clamp し、発火時は per-thread counter を更新する (計数版。
+// 計数不要な clamp は対象外)。if-else 形なのは cuda-oxide が f32::clamp を lower
+// できないため (上記「cuda-oxide 制限への対応」参照)。
+macro_rules! clamp_f16_value {
+    ($value:ident, $local_clamps:ident) => {
+        if $value > 65504.0_f32 {
+            $local_clamps += 1;
+            65504.0_f32
+        } else if $value < -65504.0_f32 {
+            $local_clamps += 1;
+            -65504.0_f32
+        } else {
+            $value
+        }
+    };
+}
+
+// f16 clamp の発火数を格納後に cumulative counter へ加算する。
+macro_rules! finish_f16_clamp_count {
+    ($clamp_counter:ident, $local_clamps:ident) => {
+        if $local_clamps > 0 {
+            // counter は cumulative: host は memset reset を出さない契約。
+            // SAFETY: caller は clamp_counter.len() == 1 を保証する。DeviceAtomicU64 は
+            // #[repr(transparent)] over UnsafeCell<u64> なので u64 と同じ layout /
+            // alignment で、同じ cell への書き込みは全て atomic。
+            let cell = unsafe { &*($clamp_counter.as_ptr() as *const DeviceAtomicU64) };
+            cell.fetch_add($local_clamps, AtomicOrdering::Relaxed);
+        }
+    };
+}
 
 mod common;
 mod layerstack;

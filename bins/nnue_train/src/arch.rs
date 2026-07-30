@@ -41,6 +41,11 @@ pub(crate) const DEFAULT_L2_OUT: usize = 32;
 /// trainer accepts `[2, MAX_SUPPORTED_NUM_BUCKETS]`.
 pub(crate) const DEFAULT_NUM_BUCKETS: usize = 9;
 
+/// Maximum LayerStack bucket count. CLI validation also needs this value in
+/// CPU-only test builds, so it mirrors the GPU module's exported limit here.
+#[cfg(any(feature = "gpu", test))]
+pub(crate) const MAX_SUPPORTED_NUM_BUCKETS: usize = shogi_features::MAX_NUM_BUCKETS;
+
 #[cfg(feature = "gpu")]
 mod gpu {
     use nnue_train::trainer::LossKind;
@@ -109,7 +114,7 @@ mod gpu {
     /// batch=65536 のとき実 scale は `2^14 * 2^16 = 2^30` で power-of-2 (scale 自体は無誤差)。
     pub(crate) const FT_DFT_FP16_BASE_SCALE: f32 = (1_u32 << 14) as f32;
 
-    /// `--fp16-opt-state` で `ft_w` の Ranger 1st moment (`m`) を `f16` 格納するときの
+    /// `--fp16-opt-state` で `ft_w` の 1st moment (`m`) を `f16` 格納するときの
     /// scale。`m` を `f16` へ書く前に掛け、読み戻し時に割る ([`radam_step_f16state`])。
     ///
     /// `m` は batch 正規化された勾配の EMA で、実測 (1000 step 時点の `ft_w` checkpoint)
@@ -119,7 +124,7 @@ mod gpu {
     /// (学習初期の勾配増大に ~24× の余裕)。scale は power-of-2 で scale 自体は無誤差。
     pub(crate) const FT_OPT_M_SCALE: f32 = (1_u32 << 28) as f32;
 
-    /// `--fp16-opt-state` で `ft_w` の Ranger 2nd moment (`v`) を `f16` 格納するときの
+    /// `--fp16-opt-state` で `ft_w` の 2nd moment (`v`) を `f16` 格納するときの
     /// scale。`v` を `f16` へ書く前に掛け、読み戻し時に割る ([`radam_step_f16state`])。
     ///
     /// `v` は勾配二乗の EMA で `m` よりさらに小さく、実測で中央値 ~2e-15・最大 ~2e-9。
@@ -133,6 +138,9 @@ mod gpu {
     // を single source of truth として参照する。
     pub(crate) const RANGER_DEFAULTS: nnue_train::optimizer::RangerParams =
         nnue_train::optimizer::RangerParams::DEFAULT;
+    /// ranger の beta1。本番経路は `OptimizerKind::beta1()` が種別ごとに解決する
+    /// ため、この const は ranger 既定値で kernel を叩く同等性テスト専用。
+    #[cfg(test)]
     pub(crate) const BETA1: f32 = RANGER_DEFAULTS.beta1;
     pub(crate) const BETA2: f32 = RANGER_DEFAULTS.beta2;
     pub(crate) const EPS: f32 = RANGER_DEFAULTS.eps;
@@ -154,8 +162,8 @@ mod gpu {
     // kernel launch ごとに対象テンソルの値を渡す。QB=64 は LayerStack と Simple 両
     // format で共通 (`nnue_format::{layerstack_weights,simple_weights}`)。
 
-    /// i8 dense weight (L1 / L1f / L2 / L3 weight) と、挙動 neutral 維持のため同じ範囲に
-    /// 据える L1 / L1f / L2 bias に渡す対称 clamp ±i8::MAX/QB (= ±127/64)。i8 量子化
+    /// i8 dense weight (L1 / L1 shared / L2 / L3 weight) と、挙動 neutral 維持のため同じ範囲に
+    /// 据える L1 / L1 shared / L2 bias に渡す対称 clamp ±i8::MAX/QB (= ±127/64)。i8 量子化
     /// `round(w·QB)` の正側端点 (127) に対応する。
     pub(crate) const W_CLAMP_QUANT_MIN: f32 =
         -(i8::MAX as f32) / nnue_format::layerstack_weights::QB as f32;
