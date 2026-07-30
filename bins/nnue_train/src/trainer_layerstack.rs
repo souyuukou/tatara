@@ -29,7 +29,6 @@ struct StepContext<'a> {
     l2_in: usize,
     l2_out: usize,
     n_out_tiles: usize,
-    padded_b: usize,
     /// tf32 per-bucket cuBLAS 経路が使う `segs[g] = (sorted 開始行, real row 数)`。
     /// forward / backward で同一値を使うため step 頭で一度だけ算出する
     /// ([`GpuTrainer::l1_bucket_segments`])。non-tf32 経路では参照されない。
@@ -114,7 +113,6 @@ impl<'a> StepContext<'a> {
             // 次元 (forward / weight backward) や内部 loop 回数を決める。`l1_out <= 16` の
             // とき `n_out_tiles == 1` で out-tile 軸は長さ 1 に縮退する。
             n_out_tiles: l1_out.div_ceil(16),
-            padded_b: padded_sort_batch(b, trainer.num_buckets),
             bucket_segments: trainer.l1_bucket_segments(batch),
         })
     }
@@ -2089,7 +2087,6 @@ impl GpuTrainer {
             l2_in,
             l2_out,
             n_out_tiles,
-            padded_b: _,
             bucket_segments,
             ..
         } = *context;
@@ -2925,7 +2922,6 @@ impl GpuTrainer {
             l2_in,
             l2_out,
             n_out_tiles,
-            padded_b: _,
             bucket_segments,
             ..
         } = *context;

@@ -472,6 +472,9 @@ impl<T: Copy> DeviceBuffer<T> {
         }
         // SAFETY: allocation is live and its exact byte length was checked in uninitialized.
         unsafe { check(cuMemsetD8_v2(buffer.raw, 0, len * size_of::<T>()))? };
+        // Non-blocking streams do not inherit legacy default-stream ordering. Complete the
+        // initialization before exposing the buffer so every stream observes the zeroed contents.
+        context.synchronize()?;
         Ok(buffer)
     }
 

@@ -87,9 +87,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for pos in positions {
         let board = parse_position(&pos)?;
         let bucket = progress.map_or_else(
-            || kingrank9_bucket_board(&board),
-            |progress| progress.bucket_board(&board, weights.num_buckets),
-        ) as usize;
+            || usize::from(kingrank9_bucket_board(&board)),
+            |progress| usize::from(progress.bucket_board(&board, weights.num_buckets)),
+        );
         let raw = forward_one_raw(&weights, spec, &board, bucket)?;
         let cp = raw / args.fv_scale;
         if args.debug {

@@ -1913,11 +1913,15 @@ fn dense_mm_bwd_weight_bucket_indexed_l3_matches_cpu() -> Result<(), Box<dyn std
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        cuda_launch! {
-            kernel: dense_mm_bwd_weight_bucket_indexed, stream: stream, module: module,
-            config: config,
-            args: [slice(x_dev), slice(dy_dev), slice(offsets_dev), slice(permutation_dev),
-                   slice(dw_dev), in_dim as u32, out_dim as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: dense_mm_bwd_weight_bucket_indexed, stream: stream, module: module,
+                config: config,
+                args: [slice(x_dev), slice(dy_dev), slice(offsets_dev), slice(permutation_dev),
+                       slice(dw_dev), in_dim as u32, out_dim as u32, nb as u32]
+            }
         }?;
         stream.synchronize()?;
         assert_close_rel(

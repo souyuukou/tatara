@@ -329,6 +329,20 @@ mod tests {
 
     #[test]
     fn quantile_load_and_num_buckets_check() {
+        const CHILD_ENV: &str = "TATARA_PROGRESS_KPABS_QUANTILE_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .arg("quantile_load_and_num_buckets_check")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("spawn isolated quantile loader test");
+            assert!(status.success(), "isolated quantile loader test failed");
+            return;
+        }
+
         let path =
             std::env::temp_dir().join(format!("tatara_progress_q_{}.bin", std::process::id()));
         let weights = vec![0.0_f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
